@@ -393,3 +393,18 @@ func TestOverSupplyScalesDownSeasonedIdleRunners(t *testing.T) {
 		t.Fatalf("scale-down emitted %d jobs, want 0", len(extra))
 	}
 }
+
+func TestSourceRequestsSurviveRestartWithoutIDReuse(t *testing.T) {
+	orgs := []config.Org{{Name: "example", ScaleSets: []config.ScaleSet{{Name: "runners", MaxRunners: 1}}}}
+	first, err := New(orgs, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(orgs, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ids.Load() >= 0 || second.ids.Load() >= 0 || first.ids.Load() == second.ids.Load() {
+		t.Fatal("request identities must differ across source lifetimes and from GitHub job IDs")
+	}
+}

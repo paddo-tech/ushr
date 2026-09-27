@@ -88,3 +88,15 @@ func TestNonCompletedActionIgnored(t *testing.T) {
 		t.Errorf("non-completed action recorded")
 	}
 }
+
+func TestStartedJobRecorded(t *testing.T) {
+	payload := strings.Replace(jobPayload, `"action": "completed"`, `"action": "in_progress"`, 1)
+	payload = strings.Replace(payload, `"completed_at": "2024-01-01T00:05:00Z"`, `"completed_at": null`, 1)
+	rec, got := post(t, "s3cr3t", payload, true)
+	if rec.Code != http.StatusOK || len(got) != 1 {
+		t.Fatalf("start event: %d %+v", rec.Code, got)
+	}
+	if got[0].StartedAt.IsZero() || !got[0].CompletedAt.IsZero() {
+		t.Fatalf("start timestamps: %+v", got[0])
+	}
+}

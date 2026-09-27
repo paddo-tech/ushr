@@ -460,7 +460,7 @@ func (s *Server) pick(name string, orgs []string, req PollRequest, live map[stri
 			}
 			found, bestScore, bestJob = true, score, j
 			best = dispatch.Record{
-				ID:        domain.RunnerName(name, j.JobID),
+				ID:        domain.RunnerName(name),
 				Agent:     livenessKey(orgs, name),
 				Pending:   domain.Job{Org: q.Org, JobID: j.JobID, Labels: j.Labels},
 				OfferedAt: s.now(),

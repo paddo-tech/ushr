@@ -161,11 +161,13 @@ func withWebhook(api http.Handler, cfg config.WebhookConfig, rec telemetry.Recor
 	}
 	slog.Info("webhook enabled", "path", "/webhook", "ledger", path)
 	sink := func(r ledger.Record) {
-		if err := led.Append(r); err != nil {
-			slog.Warn("ledger append failed", "job", r.JobID, "err", err)
+		if !r.CompletedAt.IsZero() {
+			if err := led.Append(r); err != nil {
+				slog.Warn("ledger append failed", "job", r.JobID, "err", err)
+			}
 		}
 		// Hosted: merge the GitHub-truth columns into job_runs (Noop on OSS).
-		rec.JobCompleted(r)
+		rec.JobUpdated(r)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("POST /webhook", webhook.Handler([]byte(cfg.Secret), sink))

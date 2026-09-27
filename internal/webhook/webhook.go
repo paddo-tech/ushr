@@ -1,5 +1,4 @@
-// Package webhook receives GitHub workflow_job events and feeds completed jobs
-// run on ushr runners into the ledger.
+// Package webhook receives GitHub lifecycle events for jobs served by this fleet.
 package webhook
 
 import (
@@ -13,10 +12,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/ledger"
 )
 
-// Handler validates the webhook signature with secret and, for each completed
-// workflow_job run on an ushr runner, calls sink with the job's record. Non-job
-// events, non-completed actions, and non-ushr runners are acknowledged and
-// ignored so GitHub doesn't retry them.
+// Handler accepts signed start and completion events for fleet runners.
 func Handler(secret []byte, sink func(ledger.Record)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		payload, err := github.ValidatePayload(r, secret)
@@ -30,7 +26,7 @@ func Handler(secret []byte, sink func(ledger.Record)) http.HandlerFunc {
 			return
 		}
 		e, ok := event.(*github.WorkflowJobEvent)
-		if !ok || e.GetAction() != "completed" {
+		if !ok || (e.GetAction() != "in_progress" && e.GetAction() != "completed") {
 			w.WriteHeader(http.StatusOK)
 			return
 		}

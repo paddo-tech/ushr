@@ -24,10 +24,8 @@ type Recorder interface {
 	// JobResolved records the terminal dispatch state (done|failed|lost|
 	// offer-expired) with the scheduling timestamps carried on the record.
 	JobResolved(rec dispatch.Record, status string)
-	// JobCompleted merges the GitHub webhook's view of a finished job — repo,
-	// workflow, run id, conclusion, queue/start/complete times — into the same
-	// job_runs row (either side may land first).
-	JobCompleted(r ledger.Record)
+	// JobUpdated merges GitHub job identity and lifecycle timestamps without erasing completion data.
+	JobUpdated(r ledger.Record)
 	// AgentSeen upserts agent liveness, capacity and host state under the
 	// caller's liveness key. Called on every poll; implementations throttle writes.
 	AgentSeen(b Beat)
@@ -66,7 +64,7 @@ type Beat struct {
 type Noop struct{}
 
 func (Noop) JobResolved(dispatch.Record, string) {}
-func (Noop) JobCompleted(ledger.Record)          {}
+func (Noop) JobUpdated(ledger.Record)            {}
 func (Noop) AgentUpdateTarget(context.Context, string) (UpdateTarget, error) {
 	return UpdateTarget{}, nil
 }
@@ -262,7 +260,7 @@ func (p *PG) JobResolved(rec dispatch.Record, status string) {
 	})
 }
 
-func (p *PG) JobCompleted(r ledger.Record) {
+func (p *PG) JobUpdated(r ledger.Record) {
 	labels := notNil(r.Labels)
 	p.enqueue(func(ctx context.Context) {
 		// The webhook may land before or after the agent's done report; whichever
@@ -277,20 +275,24 @@ func (p *PG) JobCompleted(r ledger.Record) {
 				 WHERE lower(github_org) IN (lower($1), lower($1 || '/' || $3)) LIMIT 1),
 				COALESCE((SELECT github_org FROM org_installations
 				 WHERE lower(github_org) IN (lower($1), lower($1 || '/' || $3)) LIMIT 1), $1),
-				$3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				$3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12)
 			ON CONFLICT (id) DO UPDATE SET
 				account_org_id = COALESCE(job_runs.account_org_id, EXCLUDED.account_org_id),
 				repo = EXCLUDED.repo,
 				workflow = EXCLUDED.workflow,
 				run_id = EXCLUDED.run_id,
-				conclusion = EXCLUDED.conclusion,
-				queued_at = EXCLUDED.queued_at,
-				started_at = EXCLUDED.started_at,
-				completed_at = EXCLUDED.completed_at`,
+				job_id = EXCLUDED.job_id,
+				conclusion = COALESCE(NULLIF(EXCLUDED.conclusion, ''), job_runs.conclusion),
+				queued_at = COALESCE(EXCLUDED.queued_at, job_runs.queued_at),
+				started_at = COALESCE(EXCLUDED.started_at, job_runs.started_at),
+				completed_at = COALESCE(EXCLUDED.completed_at, job_runs.completed_at)
+			WHERE lower(job_runs.org) IN (lower(EXCLUDED.org), lower($1), lower($1 || '/' || $3))
+			  AND (job_runs.offered_at IS NULL OR
+			       COALESCE(EXCLUDED.completed_at, EXCLUDED.started_at) >= job_runs.offered_at - interval '1 minute')`,
 			r.Org, r.RunnerName, r.Repo, r.Workflow, r.RunID, r.JobID, "", labels,
 			r.Conclusion, nullTime(r.CreatedAt), nullTime(r.StartedAt), nullTime(r.CompletedAt))
 		if err != nil {
-			slog.Warn("telemetry job completion merge failed", "runner", r.RunnerName, "err", err)
+			slog.Warn("telemetry job metadata merge failed", "runner", r.RunnerName, "err", err)
 		}
 	})
 }

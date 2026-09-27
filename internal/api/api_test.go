@@ -335,7 +335,7 @@ func TestPollClaimDone(t *testing.T) {
 	if err != nil || o == nil {
 		t.Fatalf("poll: err=%v offer=%v", err, o)
 	}
-	if o.ID != "ushr-agent-1-7" || o.Org != "paddo-tech" || o.JobID != 7 {
+	if !strings.HasPrefix(o.ID, "ushr-agent-1-") || o.Org != "paddo-tech" || o.JobID != 7 {
 		t.Fatalf("unexpected offer: %+v", o)
 	}
 
@@ -351,6 +351,19 @@ func TestPollClaimDone(t *testing.T) {
 	}
 	if got := len(led.Snapshot()); got != 0 {
 		t.Fatalf("done should clear the ledger, len=%d", got)
+	}
+	second, err := c.Poll(ctx, "agent-1", PollRequest{
+		Capacity: 2, Labels: []string{"self-hosted", "Linux", "X64"},
+		Queues: oneJob("paddo-tech", 7, 0, "self-hosted", "Linux", "X64"),
+	})
+	if err != nil || second == nil || second.ID == o.ID {
+		t.Fatalf("reused request must get a distinct dispatch: %v %+v", err, second)
+	}
+	if err := c.ReportDone(ctx, "agent-1", o.ID, DoneRequest{Status: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(led.Snapshot()); got != 1 {
+		t.Fatalf("late completion resolved a newer dispatch, len=%d", got)
 	}
 }
 

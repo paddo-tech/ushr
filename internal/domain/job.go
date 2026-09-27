@@ -4,30 +4,21 @@ package domain
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"strings"
 	"time"
 )
 
-// RunnerNamePrefix is the prefix the controller gives every JIT runner it mints
-// ("ushr-{agent}-{jobid}"). It's the contract that lets cost attribution and the
-// webhook ledger recognise a job as ushr-served, so minting and attribution must
-// share this one constant.
+// RunnerNamePrefix identifies jobs served by this fleet.
 const RunnerNamePrefix = "ushr-"
 
-// RunnerName is the dispatch id == slot handle == runner name for a job an
-// agent will run: "ushr-{agent}-{jobid}". The single source of truth, shared by
-// the control plane (which assigns it) and the agent (which mints under it).
-// JobID, not RunID: a multi-job run shares a RunID, so a RunID-based name
-// collides on the second job; JobID is unique per job, which also makes a
-// re-dispatch of the same job hit the 409-reap path rather than leak a runner.
-func RunnerName(agent string, jobID int64) string {
-	return fmt.Sprintf("%s%s-%d", RunnerNamePrefix, agent, jobID)
+// RunnerName identifies an attempt; retries must never overwrite an earlier attempt's telemetry.
+func RunnerName(agent string) string {
+	var nonce [16]byte
+	_, _ = rand.Read(nonce[:])
+	return RunnerNamePrefix + agent + "-" + hex.EncodeToString(nonce[:])
 }
 
-// RandomName returns prefix plus a random 4-byte hex suffix — the one name
-// generator for runners, VMs, and containers, so entropy/format changes land
-// everywhere at once.
+// RandomName keeps short names for local runtime resources.
 func RandomName(prefix string) string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])

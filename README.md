@@ -2,7 +2,7 @@
 
 Cross-org priority scheduler for self-hosted GitHub Actions runners. Architecture in [DESIGN.md](DESIGN.md).
 
-**Status:** v0.2.7, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
+**Status:** v0.2.8, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
 App key and the control plane never sees a credential.
 
 Run it two ways. Self-host the controller alongside the agent (`ushr setup`) and
@@ -64,6 +64,14 @@ The recovery process stays running until the service restarts.
 Each update starts a new supervisor and worker under that recovery process.
 A new dashboard request can retry a failed release. Older targets cannot downgrade an agent.
 Managed updates replace the agent binary. Use the installer to update the CLI and a local controller.
+
+## Job telemetry
+
+The dashboard combines runner dispatch records with signed GitHub `workflow_job` events.
+Set `USHR_WEBHOOK_SECRET` on the control plane and configure the GitHub App's webhook with the same secret.
+Point the webhook at `/webhook` on the control plane and subscribe to **Workflow job** events.
+Start events supply live job links. Completion events supply workflow names, results, and execution times.
+The dashboard identifies missing results and estimated slot durations.
 
 ## Development
 

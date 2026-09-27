@@ -21,6 +21,8 @@ package scaleset
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -71,7 +73,12 @@ func New(orgs []config.Org, version string) (*Source, error) {
 			}
 		}
 	}
-	return &Source{orgs: orgs, version: version}, nil
+	s := &Source{orgs: orgs, version: version}
+	var seed [8]byte
+	_, _ = rand.Read(seed[:])
+	// Negative request IDs cannot collide with GitHub job IDs or restart from one.
+	s.ids.Store(-int64(binary.LittleEndian.Uint64(seed[:])&((1<<52)-1)) - 1)
+	return s, nil
 }
 
 // Subscribe ensures every configured scale set exists, then runs one message

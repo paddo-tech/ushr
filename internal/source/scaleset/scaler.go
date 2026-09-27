@@ -149,7 +149,7 @@ func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	deficit := want - len(s.pending) - len(s.live)
 	jobs := make([]domain.Job, 0, max(deficit, 0))
 	for range deficit {
-		id := s.ids.Add(1)
+		id := s.ids.Add(-1)
 		s.pending[id] = struct{}{}
 		jobs = append(jobs, domain.Job{
 			Org:      s.org,
