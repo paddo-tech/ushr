@@ -363,11 +363,24 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		Key: livenessKey(orgs, name), Name: name, Orgs: orgs, Labels: req.Labels,
 		Capacity: req.Capacity, Busy: len(req.Busy), QueueDepth: queueDepth(req.Queues),
 		DiskFree: req.DiskFreeBytes, DiskTotal: req.DiskTotalBytes, Blocked: req.Blocked,
+		Version: req.Version, UpdateState: req.UpdateState, UpdateError: req.UpdateError,
 	})
 	// One snapshot per poll, shared by the sweep and the pick: on the Postgres
 	// store each Snapshot is a full-table read, so a second scan is pure waste.
 	live := liveJobs(s.sweep(s.ledger.Snapshot()))
 
+	if req.Version != "" {
+		target, err := s.telemetry.AgentUpdateTarget(r.Context(), livenessKey(orgs, name))
+		if err != nil {
+			http.Error(w, "update target unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if target != "" && strings.TrimPrefix(target, "v") != strings.TrimPrefix(req.Version, "v") && req.FailedVersion != target {
+			w.Header().Set("X-Ushr-Agent-Version", target)
+			s.hold(w, r)
+			return
+		}
+	}
 	if req.FreeCapacity() <= 0 {
 		s.hold(w, r)
 		return

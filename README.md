@@ -2,7 +2,7 @@
 
 Cross-org priority scheduler for self-hosted GitHub Actions runners. Architecture in [DESIGN.md](DESIGN.md).
 
-**Status:** v0.2.4, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
+**Status:** v0.2.5, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
 App key and the control plane never sees a credential.
 
 Run it two ways. Self-host the controller alongside the agent (`ushr setup`) and
@@ -50,6 +50,17 @@ Check a host any time:
 ```bash
 ushr doctor
 ```
+
+## Managed agent updates
+
+Workspace admins can select **Update agent** on a host in the Fleet dashboard.
+The host finishes active jobs before it installs the latest stable agent release.
+It downloads the official release and verifies GitHub's archive checksum.
+A supervisor restores the previous agent if the new process cannot contact the control plane within 90 seconds.
+The dashboard shows the installed version, update progress, and failures.
+
+Existing hosts need one manual installation of v0.2.5 to enable this feature.
+Managed updates replace the agent binary. Use the installer to update the CLI and a local controller.
 
 ## Development
 

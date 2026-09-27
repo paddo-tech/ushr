@@ -13,9 +13,10 @@ import (
 
 // Client is the agent-side HTTP client to the controller.
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
+	UpdateVersion string
+	BaseURL       string
+	Token         string
+	HTTP          *http.Client
 }
 
 // NewClient constructs a Client. Default timeout is generous because /poll
@@ -45,6 +46,7 @@ func (c *Client) Poll(ctx context.Context, agent string, req PollRequest) (*Offe
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.UpdateVersion = resp.Header.Get("X-Ushr-Agent-Version")
 	switch resp.StatusCode {
 	case http.StatusNoContent:
 		return nil, nil

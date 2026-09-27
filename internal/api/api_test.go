@@ -13,6 +13,7 @@ import (
 
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/enroll"
+	"github.com/paddo-tech/ushr/internal/telemetry"
 )
 
 // dupOnceStore returns ErrDuplicate on the first Offer (simulating losing an
@@ -512,5 +513,43 @@ func TestSweepPrunesStaleLiveness(t *testing.T) {
 	s.mu.Unlock()
 	if present {
 		t.Fatal("a long-gone agent's liveness entry should be pruned")
+	}
+}
+
+type updateRecorder struct {
+	telemetry.Noop
+	key string
+}
+
+func (u *updateRecorder) AgentUpdateTarget(_ context.Context, key string) (string, error) {
+	u.key = key
+	return "v0.2.5", nil
+}
+
+func TestUpdateUsesAuthenticatedHostIdentity(t *testing.T) {
+	fe := newFakeEnroll()
+	fe.tokens["token"] = agentIdentity{orgs: []string{"example-org"}, name: "host"}
+	rec := &updateRecorder{}
+	server := NewServer(0, "", memLedger(t), fe)
+	server.WithTelemetry(rec)
+	for _, name := range []string{"other-host", "host"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+name+"/poll", strings.NewReader(`{"version":"0.2.4","capacity":1}`)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer token")
+		w := httptest.NewRecorder()
+		server.Routes().ServeHTTP(w, req)
+		if name == "other-host" {
+			if rec.key != "" || w.Header().Get("X-Ushr-Agent-Version") != "" {
+				t.Fatal("another host accessed update target")
+			}
+			continue
+		}
+		if rec.key != "example-org/host" {
+			t.Fatalf("lookup key=%q", rec.key)
+		}
+		if w.Header().Get("X-Ushr-Agent-Version") != "v0.2.5" {
+			t.Fatal("missing update instruction")
+		}
 	}
 }

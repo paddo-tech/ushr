@@ -19,11 +19,13 @@ import (
 	"github.com/paddo-tech/ushr/internal/jit"
 	gh "github.com/paddo-tech/ushr/internal/source/github"
 	"github.com/paddo-tech/ushr/internal/source/scaleset"
+	"github.com/paddo-tech/ushr/internal/update"
 	"github.com/paddo-tech/ushr/internal/version"
 )
 
 func main() {
 	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "ushr", "agent.yaml"), "path to agent config")
+	worker := flag.Bool("worker", false, "run the supervised agent worker")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -32,7 +34,16 @@ func main() {
 		return
 	}
 
-	if err := run(*configPath); err != nil {
+	var err error
+	if *worker {
+		err = run(*configPath)
+	} else {
+		err = update.Supervise(*configPath)
+	}
+	if err != nil {
+		if errors.Is(err, update.ErrReady) {
+			os.Exit(update.ExitReady)
+		}
 		if errors.Is(err, context.Canceled) {
 			slog.Info("agent exited cleanly")
 			return
@@ -70,6 +81,10 @@ func run(configPath string) error {
 
 	client := api.NewClient(cfg.ControllerURL, cfg.Token)
 	a := agent.New(cfg.Name, cfg.Labels, drv, client, minter, prio, jobs)
+	a.Version = version.Version
+	a.Update = update.Prepare
+	a.Healthy = update.Healthy
+	a.FailedVersion, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
 

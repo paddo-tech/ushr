@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/disk"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
+	"github.com/paddo-tech/ushr/internal/update"
 )
 
 // Minter mints a single-use JIT runner config with the customer's own App key.
@@ -91,10 +93,15 @@ var (
 
 // Agent runs the dispatch loop and tracks busy slots.
 type Agent struct {
-	Name   string
-	Labels []string
-	Driver driver.Driver
-	Client *api.Client
+	Version       string
+	FailedVersion string
+	UpdateError   string
+	Update        func(context.Context, string) error
+	Healthy       func(context.Context) error
+	Name          string
+	Labels        []string
+	Driver        driver.Driver
+	Client        *api.Client
 
 	// MinFreeDisk is the free-space floor on the driver's image store, in bytes.
 	// Under it the agent deselects itself — it keeps polling but reports no free
@@ -200,6 +207,9 @@ func (a *Agent) ReconcileOrphans(ctx context.Context) error {
 func (a *Agent) Run(ctx context.Context) error {
 	slog.Info("agent starting", "name", a.Name, "capacity", a.Driver.Capacity(), "labels", a.Labels)
 	defer a.wg.Wait()
+	target := ""
+	var updateDone chan error
+	healthy := false
 
 	go a.drainJobs(ctx)
 	go a.reclaimLoop(ctx)
@@ -212,9 +222,29 @@ func (a *Agent) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		select {
+		case err := <-updateDone:
+			if errors.Is(err, update.ErrReady) {
+				return err
+			}
+			a.FailedVersion, a.UpdateError = target, "Agent update failed. Previous version retained."
+			slog.Error("agent update failed", "version", target, "err", err)
+			target, updateDone = "", nil
+		default:
+		}
 		a.flushReports(ctx)
 		usage, blocked := a.gateState(ctx)
+		phase := ""
+		if target != "" {
+			phase = "draining"
+			if updateDone != nil {
+				phase = "downloading"
+			}
+		} else if a.FailedVersion != "" {
+			phase = "failed"
+		}
 		req := api.PollRequest{
+			Version: a.Version, UpdateState: phase, UpdateError: a.UpdateError, FailedVersion: a.FailedVersion,
 			Capacity:       a.Driver.Capacity(),
 			Busy:           a.busyHandles(),
 			Labels:         a.Labels,
@@ -253,6 +283,34 @@ func (a *Agent) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(pollRetryDelay):
+			}
+			continue
+		}
+		if !healthy && a.Healthy != nil {
+			if err := a.Healthy(ctx); err != nil {
+				return err
+			}
+			healthy = true
+		}
+		if desired := a.Client.UpdateVersion; target == "" && a.Update != nil && desired != "" && desired != "v"+strings.TrimPrefix(a.Version, "v") && desired != a.FailedVersion {
+			target = desired
+		}
+		if target != "" {
+			if len(a.busyHandles()) == 0 {
+				a.mu.Lock()
+				reportsPending := len(a.unsent) > 0
+				a.mu.Unlock()
+				if !reportsPending && updateDone == nil {
+					updateDone = make(chan error, 1)
+					done := updateDone
+					go func(version string) {
+						done <- a.Update(ctx, version)
+						select {
+						case a.wake <- struct{}{}:
+						default:
+						}
+					}(target)
+				}
 			}
 			continue
 		}

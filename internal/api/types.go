@@ -24,10 +24,14 @@ package api
 // the agent's own view of pending work, polled from GitHub with its own key —
 // the control plane schedules on this metadata, never touching a credential.
 type PollRequest struct {
-	Capacity int        `json:"capacity"` // total concurrent slots this agent supports
-	Busy     []string   `json:"busy"`     // slot handles currently in use
-	Labels   []string   `json:"labels"`   // labels this agent's runners advertise
-	Queues   []OrgQueue `json:"queues"`   // per-org queued jobs this agent can serve
+	Version       string     `json:"version,omitempty"`
+	UpdateState   string     `json:"update_state,omitempty"`
+	UpdateError   string     `json:"update_error,omitempty"`
+	FailedVersion string     `json:"failed_version,omitempty"`
+	Capacity      int        `json:"capacity"` // total concurrent slots this agent supports
+	Busy          []string   `json:"busy"`     // slot handles currently in use
+	Labels        []string   `json:"labels"`   // labels this agent's runners advertise
+	Queues        []OrgQueue `json:"queues"`   // per-org queued jobs this agent can serve
 
 	// Disk* describe the filesystem backing the agent's image store, zero when
 	// it can't be measured. Blocked means the agent is refusing work because
@@ -66,7 +70,7 @@ func queueDepth(qs []OrgQueue) int {
 // agent has none: that is what makes the scheduler route the work to a host
 // that can actually run it, instead of one that would fail every dispatch.
 func (r PollRequest) FreeCapacity() int {
-	if r.Blocked {
+	if r.Blocked || (r.UpdateState == "draining" || r.UpdateState == "downloading") {
 		return 0
 	}
 	return r.Capacity - len(r.Busy)

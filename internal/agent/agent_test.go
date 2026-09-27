@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
+	"github.com/paddo-tech/ushr/internal/update"
 )
 
 // stuckDriver reports Running (until doneAfter status polls, if set);
@@ -483,5 +485,117 @@ func TestReportBuffersAndFlushes(t *testing.T) {
 	a.mu.Unlock()
 	if buffered != 0 {
 		t.Fatalf("flush should clear the buffer, got %d", buffered)
+	}
+}
+
+func TestManagedUpdateDrainsBeforeInstall(t *testing.T) {
+	polls := make(chan api.PollRequest, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.PollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		select {
+		case polls <- req:
+		default:
+		}
+		w.Header().Set("X-Ushr-Agent-Version", "v0.2.5")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	a := New("host", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	a.Version = "0.2.4"
+	a.markBusy("active-job")
+	updates := make(chan string, 1)
+	finishDownload := make(chan struct{})
+	a.Update = func(ctx context.Context, version string) error {
+		if ctx.Err() != nil {
+			t.Error("update cancelled the job context")
+		}
+		updates <- version
+		select {
+		case <-finishDownload:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return update.ErrReady
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	for {
+		select {
+		case req := <-polls:
+			if req.UpdateState != "draining" {
+				continue
+			}
+			if req.FreeCapacity() != 0 || req.Blocked {
+				t.Fatal("draining must remove capacity without a disk alarm")
+			}
+			select {
+			case <-updates:
+				t.Fatal("installed while a job was active")
+			default:
+			}
+			a.markFree("active-job")
+			select {
+			case version := <-updates:
+				if version != "v0.2.5" {
+					t.Fatal(version)
+				}
+			case <-ctx.Done():
+				t.Fatal("update did not start after draining")
+			}
+			for {
+				select {
+				case req := <-polls:
+					if req.UpdateState != "downloading" {
+						continue
+					}
+					if req.FreeCapacity() != 0 {
+						t.Fatal("downloading host accepted work")
+					}
+				case <-ctx.Done():
+					t.Fatal("download stopped heartbeats")
+				}
+				break
+			}
+			close(finishDownload)
+			if err := <-done; !errors.Is(err, update.ErrReady) {
+				t.Fatalf("exit=%v", err)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("agent did not enter draining state")
+		}
+	}
+}
+
+func TestFailedManagedUpdateResumesWork(t *testing.T) {
+	var calls atomic.Int64
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.PollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		if req.FailedVersion == "v0.2.5" {
+			if req.UpdateState != "failed" || req.FreeCapacity() != 1 {
+				t.Error("failed update kept host drained")
+			}
+			cancel()
+		}
+		w.Header().Set("X-Ushr-Agent-Version", "v0.2.5")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	a := New("host", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	a.Version = "0.2.4"
+	a.Update = func(context.Context, string) error { calls.Add(1); return errors.New("checksum mismatch") }
+	_ = a.Run(ctx)
+	if calls.Load() != 1 {
+		t.Fatalf("update attempts=%d", calls.Load())
 	}
 }
