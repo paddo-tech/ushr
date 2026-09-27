@@ -44,13 +44,17 @@ func TestDownload(t *testing.T) {
 		name, version       string
 		badHash, prerelease bool
 		wantError           bool
+		serverFailures      int
 	}{
 		{name: "verified release", version: "v0.2.5"},
+		{name: "temporary server failure", version: "v0.2.5", serverFailures: 1},
+		{name: "persistent server failure", version: "v0.2.5", serverFailures: 2, wantError: true},
 		{name: "checksum failure", version: "v0.2.5", badHash: true, wantError: true},
 		{name: "prerelease refused", version: "v0.2.5", prerelease: true, wantError: true},
 		{name: "path injection refused", version: "../../evil", wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			archiveRequests := 0
 			client := &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
 				if r.URL.Scheme != "https" {
 					t.Fatal("release request is not HTTPS")
@@ -64,6 +68,10 @@ func TestDownload(t *testing.T) {
 					}
 					data, _ = json.Marshal(map[string]any{"tag_name": tt.version, "prerelease": tt.prerelease, "assets": []map[string]string{{"name": "ushr_0.2.5_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz", "digest": digest}}})
 				case "github.com":
+					archiveRequests++
+					if archiveRequests <= tt.serverFailures {
+						return &http.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("temporary failure"))}, nil
+					}
 					data = archive
 				default:
 					t.Fatalf("unexpected release host %s", r.URL.Host)
@@ -72,6 +80,9 @@ func TestDownload(t *testing.T) {
 			})}
 			dst := filepath.Join(t.TempDir(), "agent.next")
 			err := download(context.Background(), client, tt.version, dst)
+			if tt.serverFailures > 0 && archiveRequests != 2 {
+				t.Fatalf("archive requests=%d, want 2", archiveRequests)
+			}
 			if (err != nil) != tt.wantError {
 				t.Fatalf("download error=%v", err)
 			}

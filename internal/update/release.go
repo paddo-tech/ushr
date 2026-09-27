@@ -53,15 +53,24 @@ func download(ctx context.Context, client *http.Client, version, dst string) err
 		if err != nil {
 			return nil, err
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != http.StatusOK {
+		for attempt := 0; ; attempt++ {
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode == http.StatusOK {
+				return resp.Body, nil
+			}
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("release download returned HTTP %d", resp.StatusCode)
+			if attempt > 0 || resp.StatusCode < 500 || resp.StatusCode >= 600 {
+				return nil, fmt.Errorf("release download returned HTTP %d", resp.StatusCode)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Second):
+			}
 		}
-		return resp.Body, nil
 	}
 	body, err := get("https://api.github.com/repos/paddo-tech/ushr/releases/tags/" + version)
 	if err != nil {

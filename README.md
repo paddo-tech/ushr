@@ -2,7 +2,7 @@
 
 Cross-org priority scheduler for self-hosted GitHub Actions runners. Architecture in [DESIGN.md](DESIGN.md).
 
-**Status:** v0.2.5, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
+**Status:** v0.2.6, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
 App key and the control plane never sees a credential.
 
 Run it two ways. Self-host the controller alongside the agent (`ushr setup`) and
