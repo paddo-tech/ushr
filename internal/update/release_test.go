@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,16 +40,17 @@ func TestDownload(t *testing.T) {
 	archive := buf.Bytes()
 	sum := sha256.Sum256(archive)
 	for _, tt := range []struct {
-		name, version       string
-		badHash, prerelease bool
-		wantError           bool
-		serverFailures      int
+		name, version        string
+		badHash, missingHash bool
+		wantError            bool
+		serverFailures       int
 	}{
 		{name: "verified release", version: "v0.2.5"},
 		{name: "temporary server failure", version: "v0.2.5", serverFailures: 1},
 		{name: "persistent server failure", version: "v0.2.5", serverFailures: 2, wantError: true},
 		{name: "checksum failure", version: "v0.2.5", badHash: true, wantError: true},
-		{name: "prerelease refused", version: "v0.2.5", prerelease: true, wantError: true},
+		{name: "prerelease tag refused", version: "v0.2.5-rc1", wantError: true},
+		{name: "missing checksum", version: "v0.2.5", missingHash: true, wantError: true},
 		{name: "path injection refused", version: "../../evil", wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -59,23 +59,31 @@ func TestDownload(t *testing.T) {
 				if r.URL.Scheme != "https" {
 					t.Fatal("release request is not HTTPS")
 				}
+				if r.URL.Host != "github.com" {
+					t.Fatalf("unexpected release host %s", r.URL.Host)
+				}
+				name := "ushr_0.2.5_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz"
 				var data []byte
-				switch r.URL.Host {
-				case "api.github.com":
-					digest := fmt.Sprintf("sha256:%x", sum)
+				switch r.URL.Path {
+				case "/paddo-tech/ushr/releases/download/v0.2.5/checksums.txt":
+					digest := fmt.Sprintf("%x", sum)
 					if tt.badHash {
-						digest = "sha256:" + strings.Repeat("0", 64)
+						digest = strings.Repeat("0", 64)
 					}
-					data, _ = json.Marshal(map[string]any{"tag_name": tt.version, "prerelease": tt.prerelease, "assets": []map[string]string{{"name": "ushr_0.2.5_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz", "digest": digest}}})
-				case "github.com":
+					if tt.missingHash {
+						name = "another-archive.tar.gz"
+					}
+					data = []byte(digest + "  " + name + "\n")
+				case "/paddo-tech/ushr/releases/download/v0.2.5/" + name:
 					archiveRequests++
 					if archiveRequests <= tt.serverFailures {
 						return &http.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("temporary failure"))}, nil
 					}
 					data = archive
 				default:
-					t.Fatalf("unexpected release host %s", r.URL.Host)
+					t.Fatalf("unexpected release path %s", r.URL.Path)
 				}
+
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(data))}, nil
 			})}
 			dst := filepath.Join(t.TempDir(), "agent.next")
@@ -125,6 +133,12 @@ func TestInstallRollback(t *testing.T) {
 	got, _ := os.ReadFile(exe)
 	if string(got) != "candidate" {
 		t.Fatal("candidate not installed")
+	}
+	if err := os.Link(exe+".previous", exe+".restore"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(exe+".restore", exe); err != nil {
+		t.Fatal(err)
 	}
 	if err := rollback(exe, &state); err != nil {
 		t.Fatal(err)

@@ -13,6 +13,7 @@ import (
 
 // Client is the agent-side HTTP client to the controller.
 type Client struct {
+	UpdateRequest string
 	UpdateVersion string
 	BaseURL       string
 	Token         string
@@ -47,6 +48,7 @@ func (c *Client) Poll(ctx context.Context, agent string, req PollRequest) (*Offe
 	}
 	defer func() { _ = resp.Body.Close() }()
 	c.UpdateVersion = resp.Header.Get("X-Ushr-Agent-Version")
+	c.UpdateRequest = resp.Header.Get("X-Ushr-Agent-Request")
 	switch resp.StatusCode {
 	case http.StatusNoContent:
 		return nil, nil

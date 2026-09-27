@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -521,9 +523,9 @@ type updateRecorder struct {
 	key string
 }
 
-func (u *updateRecorder) AgentUpdateTarget(_ context.Context, key string) (string, error) {
+func (u *updateRecorder) AgentUpdateTarget(_ context.Context, key string) (telemetry.UpdateTarget, error) {
 	u.key = key
-	return "v0.2.5", nil
+	return telemetry.UpdateTarget{Version: "v0.2.5", Request: "request-1"}, nil
 }
 
 func TestUpdateUsesAuthenticatedHostIdentity(t *testing.T) {
@@ -535,7 +537,7 @@ func TestUpdateUsesAuthenticatedHostIdentity(t *testing.T) {
 	for _, name := range []string{"other-host", "host"} {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+name+"/poll", strings.NewReader(`{"version":"0.2.4","capacity":1}`)).WithContext(ctx)
+		req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+name+"/poll", strings.NewReader(`{"version":"0.2.4","update_protocol":2,"capacity":1}`)).WithContext(ctx)
 		req.Header.Set("Authorization", "Bearer token")
 		w := httptest.NewRecorder()
 		server.Routes().ServeHTTP(w, req)
@@ -551,5 +553,42 @@ func TestUpdateUsesAuthenticatedHostIdentity(t *testing.T) {
 		if w.Header().Get("X-Ushr-Agent-Version") != "v0.2.5" {
 			t.Fatal("missing update instruction")
 		}
+	}
+}
+
+func TestUpdateTargetPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name, version, failedRequest string
+		protocol                     int
+		offer                        bool
+	}{
+		{name: "new release", version: "0.2.4", protocol: 2, offer: true},
+		{name: "same release", version: "0.2.5", protocol: 2},
+		{name: "newer installed", version: "0.2.6", protocol: 2},
+		{name: "numeric ordering", version: "0.2.10", protocol: 2},
+		{name: "unsupported protocol", version: "0.2.4", protocol: 0},
+		{name: "failed request", version: "0.2.4", protocol: 2, failedRequest: "request-1"},
+		{name: "manual retry", version: "0.2.4", protocol: 2, failedRequest: "earlier-request", offer: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewServer(0, "", memLedger(t), nil)
+			server.WithTelemetry(&updateRecorder{})
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			body, _ := json.Marshal(PollRequest{Version: tt.version, UpdateProtocol: tt.protocol, FailedVersion: "v0.2.5", FailedRequest: tt.failedRequest})
+			if tt.failedRequest == "" {
+				body, _ = json.Marshal(PollRequest{Version: tt.version, UpdateProtocol: tt.protocol})
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/agents/host/poll", bytes.NewReader(body)).WithContext(ctx)
+			w := httptest.NewRecorder()
+			server.Routes().ServeHTTP(w, req)
+			offered := w.Header().Get("X-Ushr-Agent-Version") != ""
+			if offered != tt.offer {
+				t.Fatalf("update instruction=%v, want %v", offered, tt.offer)
+			}
+			if offered && w.Header().Get("X-Ushr-Agent-Request") != "request-1" {
+				t.Fatal("missing request identifier")
+			}
+		})
 	}
 }

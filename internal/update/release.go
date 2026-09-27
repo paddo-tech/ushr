@@ -3,10 +3,10 @@ package update
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +23,7 @@ var releaseVersion = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
 
 const ExitReady = 75
 
-func Prepare(ctx context.Context, version string) error {
+func Prepare(ctx context.Context, version, request string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -37,7 +37,7 @@ func Prepare(ctx context.Context, version string) error {
 	if err != nil {
 		return err
 	}
-	state.Target = version
+	state.Target, state.Request = version, request
 	if err := writeState(exe, state); err != nil {
 		return err
 	}
@@ -72,35 +72,25 @@ func download(ctx context.Context, client *http.Client, version, dst string) err
 			}
 		}
 	}
-	body, err := get("https://api.github.com/repos/paddo-tech/ushr/releases/tags/" + version)
+	name := "ushr_" + strings.TrimPrefix(version, "v") + "_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz"
+	body, err := get("https://github.com/paddo-tech/ushr/releases/download/" + version + "/checksums.txt")
 	if err != nil {
 		return err
 	}
-	var rel struct {
-		Tag        string `json:"tag_name"`
-		Draft      bool   `json:"draft"`
-		Prerelease bool   `json:"prerelease"`
-		Assets     []struct {
-			Name   string `json:"name"`
-			Digest string `json:"digest"`
-		} `json:"assets"`
+	digest := ""
+	scanner := bufio.NewScanner(io.LimitReader(body, 2<<20))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 2 && fields[1] == name {
+			digest = fields[0]
+		}
 	}
-	err = json.NewDecoder(io.LimitReader(body, 2<<20)).Decode(&rel)
+	err = scanner.Err()
 	_ = body.Close()
 	if err != nil {
 		return err
 	}
-	if rel.Tag != version || rel.Draft || rel.Prerelease {
-		return errors.New("release is not a published stable version")
-	}
-	name := "ushr_" + strings.TrimPrefix(version, "v") + "_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz"
-	digest := ""
-	for _, a := range rel.Assets {
-		if a.Name == name {
-			digest = a.Digest
-		}
-	}
-	if !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(digest) {
+	if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(digest) {
 		return errors.New("release has no archive checksum for this host")
 	}
 	body, err = get("https://github.com/paddo-tech/ushr/releases/download/" + version + "/" + name)
@@ -118,7 +108,7 @@ func download(ctx context.Context, client *http.Client, version, dst string) err
 	if err != nil {
 		return err
 	}
-	if n > 256<<20 || "sha256:"+fmt.Sprintf("%x", hash.Sum(nil)) != digest {
+	if n > 256<<20 || fmt.Sprintf("%x", hash.Sum(nil)) != digest {
 		return errors.New("release archive checksum mismatch")
 	}
 	if _, err = archive.Seek(0, io.SeekStart); err != nil {

@@ -25,6 +25,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "ushr", "agent.yaml"), "path to agent config")
+	supervised := flag.Bool("supervised", false, "run the supervised worker manager")
 	worker := flag.Bool("worker", false, "run the supervised agent worker")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -37,6 +38,8 @@ func main() {
 	var err error
 	if *worker {
 		err = run(*configPath)
+	} else if *supervised {
+		err = update.SuperviseWorker(*configPath)
 	} else {
 		err = update.Supervise(*configPath)
 	}
@@ -84,7 +87,7 @@ func run(configPath string) error {
 	a.Version = version.Version
 	a.Update = update.Prepare
 	a.Healthy = update.Healthy
-	a.FailedVersion, a.UpdateError = update.Status()
+	a.FailedVersion, a.FailedRequest, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
 

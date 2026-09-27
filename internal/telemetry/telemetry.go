@@ -20,7 +20,7 @@ import (
 
 // Recorder receives lifecycle signals from the server and webhook.
 type Recorder interface {
-	AgentUpdateTarget(context.Context, string) (string, error)
+	AgentUpdateTarget(context.Context, string) (UpdateTarget, error)
 	// JobResolved records the terminal dispatch state (done|failed|lost|
 	// offer-expired) with the scheduling timestamps carried on the record.
 	JobResolved(rec dispatch.Record, status string)
@@ -35,19 +35,25 @@ type Recorder interface {
 	Event(org, dispatchID, event string, payload map[string]any)
 }
 
+type UpdateTarget struct {
+	Version string
+	Request string
+}
+
 // Beat is one agent heartbeat: its liveness identity plus the capacity and
 // image-store state carried on the poll. Blocked means the agent is refusing
 // work because its store is under the host's free-space floor.
 type Beat struct {
-	Version     string
-	UpdateState string
-	UpdateError string
-	Key         string
-	Name        string
-	Orgs        []string
-	Labels      []string
-	Capacity    int
-	Busy        int
+	UpdateProtocol int
+	Version        string
+	UpdateState    string
+	UpdateError    string
+	Key            string
+	Name           string
+	Orgs           []string
+	Labels         []string
+	Capacity       int
+	Busy           int
 	// QueueDepth is how many jobs the agent reports as pending. On a blocked
 	// host it is the difference between "idle" and "stalled with work waiting".
 	QueueDepth int
@@ -59,11 +65,13 @@ type Beat struct {
 // Noop is the OSS default: telemetry disabled.
 type Noop struct{}
 
-func (Noop) JobResolved(dispatch.Record, string)                       {}
-func (Noop) JobCompleted(ledger.Record)                                {}
-func (Noop) AgentUpdateTarget(context.Context, string) (string, error) { return "", nil }
-func (Noop) AgentSeen(Beat)                                            {}
-func (Noop) Event(string, string, string, map[string]any)              {}
+func (Noop) JobResolved(dispatch.Record, string) {}
+func (Noop) JobCompleted(ledger.Record)          {}
+func (Noop) AgentUpdateTarget(context.Context, string) (UpdateTarget, error) {
+	return UpdateTarget{}, nil
+}
+func (Noop) AgentSeen(Beat)                               {}
+func (Noop) Event(string, string, string, map[string]any) {}
 
 const opTimeout = 5 * time.Second
 
@@ -119,6 +127,8 @@ ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS blocked boolean NOT NULL DEFAU
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS queue_depth int NOT NULL DEFAULT 0;
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS version text NOT NULL DEFAULT '';
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS desired_version text NOT NULL DEFAULT '';
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_request text NOT NULL DEFAULT '';
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_protocol integer NOT NULL DEFAULT 0;
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_state text NOT NULL DEFAULT '';
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_error text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS dispatch_events (
@@ -326,8 +336,8 @@ func (p *PG) AgentSeen(b Beat) {
 	}
 	p.enqueue(func(ctx context.Context) {
 		_, err := p.pool.Exec(ctx, `
-			INSERT INTO agent_status (key, name, account_org_id, orgs, labels, capacity, busy, queue_depth, disk_free_bytes, disk_total_bytes, blocked, version, update_state, update_error, last_seen)
-			VALUES ($2, $3, `+accountFor+`, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
+			INSERT INTO agent_status (key, name, account_org_id, orgs, labels, capacity, busy, queue_depth, disk_free_bytes, disk_total_bytes, blocked, version, update_state, update_error, update_protocol, last_seen)
+			VALUES ($2, $3, `+accountFor+`, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
 			ON CONFLICT (key) DO UPDATE SET
 				orgs = EXCLUDED.orgs, labels = EXCLUDED.labels,
 				capacity = EXCLUDED.capacity, busy = EXCLUDED.busy,
@@ -335,11 +345,12 @@ func (p *PG) AgentSeen(b Beat) {
 				disk_free_bytes = EXCLUDED.disk_free_bytes,
 				disk_total_bytes = EXCLUDED.disk_total_bytes,
 				blocked = EXCLUDED.blocked,
- version = EXCLUDED.version, update_state = EXCLUDED.update_state, update_error = EXCLUDED.update_error,
+ desired_version = CASE WHEN ltrim(agent_status.desired_version, 'v') = ltrim(EXCLUDED.version, 'v') THEN '' ELSE agent_status.desired_version END,
+ update_protocol = EXCLUDED.update_protocol, version = EXCLUDED.version, update_state = EXCLUDED.update_state, update_error = EXCLUDED.update_error,
 				account_org_id = COALESCE(EXCLUDED.account_org_id, agent_status.account_org_id),
 				last_seen = EXCLUDED.last_seen`,
 			org, b.Key, b.Name, orgsArg, labelsArg, b.Capacity, b.Busy, b.QueueDepth,
-			diskFree, diskTotal, b.Blocked, b.Version, b.UpdateState, b.UpdateError)
+			diskFree, diskTotal, b.Blocked, b.Version, b.UpdateState, b.UpdateError, b.UpdateProtocol)
 		if err != nil {
 			slog.Warn("telemetry agent_status upsert failed", "agent", b.Key, "err", err)
 		}
@@ -366,10 +377,10 @@ func (p *PG) Event(org, dispatchID, event string, payload map[string]any) {
 	})
 }
 
-func (p *PG) AgentUpdateTarget(ctx context.Context, key string) (string, error) {
+func (p *PG) AgentUpdateTarget(ctx context.Context, key string) (UpdateTarget, error) {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
-	var target string
-	err := p.pool.QueryRow(ctx, `SELECT COALESCE((SELECT desired_version FROM agent_status WHERE key=$1),'')`, key).Scan(&target)
+	var target UpdateTarget
+	err := p.pool.QueryRow(ctx, `SELECT COALESCE((SELECT desired_version FROM agent_status WHERE key=$1),''), COALESCE((SELECT update_request FROM agent_status WHERE key=$1),'')`, key).Scan(&target.Version, &target.Request)
 	return target, err
 }

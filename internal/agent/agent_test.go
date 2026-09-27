@@ -508,7 +508,7 @@ func TestManagedUpdateDrainsBeforeInstall(t *testing.T) {
 	a.markBusy("active-job")
 	updates := make(chan string, 1)
 	finishDownload := make(chan struct{})
-	a.Update = func(ctx context.Context, version string) error {
+	a.Update = func(ctx context.Context, version, request string) error {
 		if ctx.Err() != nil {
 			t.Error("update cancelled the job context")
 		}
@@ -593,9 +593,71 @@ func TestFailedManagedUpdateResumesWork(t *testing.T) {
 	defer srv.Close()
 	a := New("host", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
 	a.Version = "0.2.4"
-	a.Update = func(context.Context, string) error { calls.Add(1); return errors.New("checksum mismatch") }
+	a.Update = func(context.Context, string, string) error { calls.Add(1); return errors.New("checksum mismatch") }
 	_ = a.Run(ctx)
 	if calls.Load() != 1 {
 		t.Fatalf("update attempts=%d", calls.Load())
+	}
+}
+
+func TestManagedUpdateRetriesOnlyNewRequest(t *testing.T) {
+	var calls, failedPolls atomic.Int64
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.PollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		request := "first"
+		if req.FailedRequest == "first" && failedPolls.Add(1) >= 3 {
+			request = "second"
+		}
+		w.Header().Set("X-Ushr-Agent-Version", "v0.2.5")
+		w.Header().Set("X-Ushr-Agent-Request", request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	a := New("host", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	a.Version = "0.2.4"
+	a.Update = func(_ context.Context, _ string, request string) error {
+		n := calls.Add(1)
+		if n == 1 {
+			if request != "first" {
+				t.Errorf("first request=%q", request)
+			}
+			return errors.New("temporary download failure")
+		}
+		if request != "second" {
+			t.Errorf("retried blocked request %q", request)
+		}
+		return update.ErrReady
+	}
+	if err := a.Run(ctx); !errors.Is(err, update.ErrReady) {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("update calls=%d", calls.Load())
+	}
+}
+
+func TestManagedUpdateRejectsDowngrade(t *testing.T) {
+	var polls, calls atomic.Int64
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if polls.Add(1) == 2 {
+			cancel()
+		}
+		w.Header().Set("X-Ushr-Agent-Version", "v0.2.5")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	a := New("host", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	a.Version = "0.2.6"
+	a.Update = func(context.Context, string, string) error { calls.Add(1); return update.ErrReady }
+	_ = a.Run(ctx)
+	if calls.Load() != 0 {
+		t.Fatal("agent attempted downgrade")
 	}
 }

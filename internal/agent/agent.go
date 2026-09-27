@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
 	"github.com/paddo-tech/ushr/internal/update"
+	"github.com/paddo-tech/ushr/internal/version"
 )
 
 // Minter mints a single-use JIT runner config with the customer's own App key.
@@ -94,9 +94,10 @@ var (
 // Agent runs the dispatch loop and tracks busy slots.
 type Agent struct {
 	Version       string
+	FailedRequest string
 	FailedVersion string
 	UpdateError   string
-	Update        func(context.Context, string) error
+	Update        func(context.Context, string, string) error
 	Healthy       func(context.Context) error
 	Name          string
 	Labels        []string
@@ -207,7 +208,7 @@ func (a *Agent) ReconcileOrphans(ctx context.Context) error {
 func (a *Agent) Run(ctx context.Context) error {
 	slog.Info("agent starting", "name", a.Name, "capacity", a.Driver.Capacity(), "labels", a.Labels)
 	defer a.wg.Wait()
-	target := ""
+	target, request := "", ""
 	var updateDone chan error
 	healthy := false
 
@@ -227,7 +228,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if errors.Is(err, update.ErrReady) {
 				return err
 			}
-			a.FailedVersion, a.UpdateError = target, "Agent update failed. Previous version retained."
+			a.FailedVersion, a.FailedRequest, a.UpdateError = target, request, "Agent update failed. Previous version retained."
 			slog.Error("agent update failed", "version", target, "err", err)
 			target, updateDone = "", nil
 		default:
@@ -244,7 +245,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			phase = "failed"
 		}
 		req := api.PollRequest{
-			Version: a.Version, UpdateState: phase, UpdateError: a.UpdateError, FailedVersion: a.FailedVersion,
+			UpdateProtocol: 2, Version: a.Version, UpdateState: phase, UpdateError: a.UpdateError, FailedVersion: a.FailedVersion, FailedRequest: a.FailedRequest,
 			Capacity:       a.Driver.Capacity(),
 			Busy:           a.busyHandles(),
 			Labels:         a.Labels,
@@ -292,8 +293,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 			healthy = true
 		}
-		if desired := a.Client.UpdateVersion; target == "" && a.Update != nil && desired != "" && desired != "v"+strings.TrimPrefix(a.Version, "v") && desired != a.FailedVersion {
-			target = desired
+		if desired := a.Client.UpdateVersion; target == "" && a.Update != nil && version.Newer(desired, a.Version) && (desired != a.FailedVersion || a.Client.UpdateRequest != a.FailedRequest) {
+			target, request = desired, a.Client.UpdateRequest
+			a.UpdateError = ""
 		}
 		if target != "" {
 			if len(a.busyHandles()) == 0 {
@@ -303,13 +305,13 @@ func (a *Agent) Run(ctx context.Context) error {
 				if !reportsPending && updateDone == nil {
 					updateDone = make(chan error, 1)
 					done := updateDone
-					go func(version string) {
-						done <- a.Update(ctx, version)
+					go func(version, request string) {
+						done <- a.Update(ctx, version, request)
 						select {
 						case a.wake <- struct{}{}:
 						default:
 						}
-					}(target)
+					}(target, request)
 				}
 			}
 			continue
