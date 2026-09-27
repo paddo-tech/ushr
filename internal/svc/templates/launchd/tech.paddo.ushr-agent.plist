@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>tech.paddo.ushr-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/ushr-agent</string>
+        <string>-config</string>
+        <string>__HOME__/.config/ushr/agent.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- tart, ssh, curl, etc. need to be on PATH for the Tart driver -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/ushr/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/ushr/agent.log</string>
+    <key>WorkingDirectory</key>
+    <string>__HOME__/Library/Application Support/ushr</string>
+</dict>
+</plist>

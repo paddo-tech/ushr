@@ -1,0 +1,17 @@
+version: "1"
+listen: 127.0.0.1:7080
+
+# Shared bearer token between control plane and agent.
+# Empty string disables auth — the control plane refuses to start if `listen`
+# is non-loopback while token is empty (prevents accidental exposure).
+token: ""
+
+# The control plane is keyless: it schedules on the metadata agents report and
+# holds no GitHub App keys or poll source (those live in the agent config).
+# `orgs` here, if present, is used solely by the local `ushr cost` report,
+# which reads GitHub directly.
+
+policy:
+  type: priority
+  aging:
+    boost_per_minute: 1       # priority points added per minute waiting

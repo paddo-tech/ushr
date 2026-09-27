@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    # Self-hosted runners must never execute fork PRs, even while the repo is
+    # private and forks are restricted.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: go build ./...
+      # The runner container image ships no C toolchain, which -race needs.
+      - run: which gcc || (sudo apt-get update -qq && sudo apt-get install -y -qq gcc)
+      - run: go test -race ./...
+        env:
+          CGO_ENABLED: 1
+
+  lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12

@@ -1,0 +1,48 @@
+version: 2
+project_name: ushr
+
+builds:
+  - id: ushr
+    main: ./cmd/ushr
+    binary: ushr
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    ignore:
+      # tart needs Apple Silicon; no Intel mac target.
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w -X github.com/paddo-tech/ushr/internal/version.Version={{.Version}}
+  - id: ushr-controller
+    main: ./cmd/controller
+    binary: ushr-controller
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w -X github.com/paddo-tech/ushr/internal/version.Version={{.Version}}
+  - id: ushr-agent
+    main: ./cmd/agent
+    binary: ushr-agent
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w -X github.com/paddo-tech/ushr/internal/version.Version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "ushr_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true

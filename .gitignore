@@ -1,0 +1,25 @@
+# Secrets
+*.pem
+*.key
+*.p12
+.env
+.env.*
+
+# Local configs
+controller.yaml
+agent.yaml
+*.local.yaml
+
+# Build artifacts
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+vendor/
+
+# macOS
+.DS_Store
+/integration-test
+/ushr

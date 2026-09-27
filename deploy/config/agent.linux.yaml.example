@@ -1,0 +1,62 @@
+version: "1"
+controller_url: http://127.0.0.1:7080
+
+# Must match controller.token. Empty string is loopback-only — controller
+# refuses to bind beyond 127.0.0.1 / ::1 with an empty token.
+token: ""
+name: linux-runner-1
+labels:
+  - self-hosted
+  - Linux
+  - X64
+
+driver:
+  # "docker" is the container-CLI driver. It autodetects the runtime (docker,
+  # then podman) — either works, no shim. Pin it if you have both installed.
+  type: docker
+  # runtime: podman
+  image: ghcr.io/actions/actions-runner:latest   # linux/amd64 runner image; entrypoint run.sh must accept --jitconfig
+  capacity: 16                                    # bounded by host CPU/RAM, not Apple's 2-VM cap
+  # min_free_gb: 25        # free space in the container data root under which this
+  #                        # host stops taking jobs, so they stay schedulable on a
+  #                        # host with room instead of failing every dispatch here.
+  #                        # Also the mark reclaim keeps clear. Default 25;
+  #                        # negative disables the gate but keeps reclaim running.
+  # exclusive_daemon: true # only ushr runners use this docker/podman daemon, so
+  #                        # reclaim may also collect the containers, volumes and
+  #                        # images jobs leave behind through the shared socket
+  #                        # (it deselects the host and waits for it to go idle
+  #                        # first). Off by default: on a shared daemon those
+  #                        # objects belong to someone else.
+  # network: host          # simplest egress for rootless; omit for the default bridge
+  # memory: "8g"           # per-runner cap; needs cgroup v2 delegation under rootless
+  # build_cache: false     # per-repo persistent buildx builders are ON by default:
+  #                        # docker builds reuse that repo's cache between jobs,
+  #                        # cache-isolated from other repos (a separate cache
+  #                        # store, NOT a trust boundary — jobs share the host
+  #                        # docker socket, so keep untrusted PRs off the host).
+  #                        # Needs the buildx plugin on the host (apt install
+  #                        # docker-buildx) and a workflow that uses the default
+  #                        # builder (no setup-buildx-action); without buildx,
+  #                        # jobs simply run uncached. Set false to opt out.
+  # buildkit_image: moby/buildkit:buildx-stable-1
+  # build_cache_gb: 20         # per-repo cache cap before a prune
+  # build_cache_idle_hours: 168 # reap a repo's builder after this long idle (7d)
+
+# Model B (keyless control plane): the agent holds the GitHub App key, polls
+# GitHub, and mints JIT configs itself — the control plane never sees a
+# credential. `ushr setup --org NAME` creates the App and writes the key here.
+orgs:
+  - name: paddo-tech
+    app_id: 0                 # set to your GitHub App ID
+    private_key_path: __HOME__/.secrets/paddo-tech-app.pem
+    priority: 100             # advisory; the control plane owns final priority
+source:
+  type: poll
+  interval: 30s               # how often to poll GitHub for queued runs
+  # Or Runner Scale Sets (no polling: GitHub pushes desired counts; the set
+  # name doubles as the runs-on label). Declare sets under the org:
+  #   orgs[].scale_sets:
+  #     - name: my-scale-set
+  #       max_runners: 8
+  # type: scaleset

@@ -1,0 +1,34 @@
+version: "1"
+controller_url: http://127.0.0.1:7080
+
+# Must match controller.token. Empty string is loopback-only — controller
+# refuses to bind beyond 127.0.0.1 / ::1 with an empty token.
+token: ""
+name: mac-runner-1
+labels:
+  - self-hosted
+  - macOS
+  - ARM64
+  - paddo-runner-mac
+
+driver:
+  type: tart
+  image: paddo-runner-mac     # base image to clone for each ephemeral runner
+  capacity: 2                 # Apple's macOS guest VM cap
+  # min_free_gb: 60           # free space in ~/.tart under which this host stops
+  #                           # taking jobs, so they stay schedulable on a host
+  #                           # with room instead of failing every clone here.
+  #                           # Also the mark reclaim keeps clear. Default 60;
+  #                           # negative disables the gate, reclaim keeps running.
+
+# Model B (keyless control plane): the agent holds the GitHub App key, polls
+# GitHub, and mints JIT configs itself. `ushr setup --org NAME` creates the App
+# and writes the key here.
+orgs:
+  - name: paddo-tech
+    app_id: 0
+    private_key_path: __HOME__/.secrets/paddo-tech-app.pem
+    priority: 100
+source:
+  type: poll
+  interval: 30s

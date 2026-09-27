@@ -1,0 +1,10 @@
+[Unit]
+Description=ushr controller
+
+[Service]
+ExecStart=%h/.local/bin/ushr-controller -config %h/.config/ushr/controller.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
