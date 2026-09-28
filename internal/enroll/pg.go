@@ -97,6 +97,7 @@ type PG struct {
 }
 
 // Webhook follows the host's live token, so rotation keeps the connection and revocation ends it.
+// An unknown or disconnected id returns an empty secret.
 func (p *PG) Webhook(ctx context.Context, id string) (secret, scope, name string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
@@ -107,6 +108,9 @@ func (p *PG) Webhook(ctx context.Context, id string) (secret, scope, name string
  JOIN org_installations o ON lower(o.github_org) = lower(a.scope) AND o.account_org_id = t.account_org_id
  WHERE a.id = $1 AND a.webhook_secret IS NOT NULL
  AND EXISTS (SELECT 1 FROM unnest(t.orgs) scope WHERE lower(scope) = lower(a.scope))`, id).Scan(&secret, &scope, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = nil
+	}
 	return
 }
 

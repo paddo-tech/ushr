@@ -21,7 +21,12 @@ type Resolver interface {
 func ScopedHandler(resolver Resolver, sink func(ledger.Record)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		secret, scope, name, err := resolver.Webhook(r.Context(), r.PathValue("id"))
-		if err != nil || secret == "" {
+		// A 5xx marks the delivery failed in GitHub, so it can be redelivered.
+		if err != nil {
+			http.Error(w, "lookup failed", http.StatusServiceUnavailable)
+			return
+		}
+		if secret == "" {
 			http.Error(w, "unknown connection", http.StatusUnauthorized)
 			return
 		}

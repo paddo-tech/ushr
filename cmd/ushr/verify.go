@@ -65,15 +65,14 @@ func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, install
 	for {
 		checkCtx, checkCancel := context.WithTimeout(waitCtx, 10*time.Second)
 		ok, err := appInstalled(checkCtx, appID, key, scope)
-		timedOut := checkCtx.Err() != nil
 		checkCancel()
 		if ok {
 			fmt.Println("==> GitHub app installed on", scope)
 			return nil
 		}
-		// Slow, rate-limited, and failing GitHub checks retry; only a definite rejection stops setup.
+		// Network errors, rate limits, and GitHub failures retry; only a definite rejection stops setup.
 		status := githubStatus(err)
-		if err != nil && !timedOut && status != http.StatusNotFound && status != http.StatusTooManyRequests && status < 500 {
+		if status >= 400 && status < 500 && status != http.StatusNotFound && status != http.StatusTooManyRequests {
 			return fmt.Errorf("check GitHub installation: %w", err)
 		}
 		select {

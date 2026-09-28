@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -25,6 +26,8 @@ import (
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/svc"
 )
+
+var appNameChars = regexp.MustCompile(`[^A-Za-z0-9-]+`)
 
 const (
 	manifestName = "ushr"
@@ -164,8 +167,9 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	// App names must be alphanumeric+dashes, so flatten "owner/repo".
-	appName := fmt.Sprintf("%s-%s-%s", manifestName, strings.ReplaceAll(scope, "/", "-"), suffix)
+	// GitHub App names allow 34 letters, digits, and dashes; the suffix comes first so truncation keeps names unique.
+	appName := manifestName + "-" + suffix + "-" + appNameChars.ReplaceAllString(scope, "-")
+	appName = strings.TrimRight(appName[:min(len(appName), 34)], "-")
 	manifest := manifestJSON(appName, fmt.Sprintf("http://localhost:%d/callback", port), perms)
 
 	localURL := fmt.Sprintf("http://localhost:%d/", port)

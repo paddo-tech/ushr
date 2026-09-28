@@ -105,13 +105,14 @@ func TestStartedJobRecorded(t *testing.T) {
 }
 
 type scopedResolver struct {
-	scope string
-	name  string
-	err   error
+	secret string
+	scope  string
+	name   string
+	err    error
 }
 
 func (r scopedResolver) Webhook(context.Context, string) (string, string, string, error) {
-	return "tenant-secret", r.scope, r.name, r.err
+	return r.secret, r.scope, r.name, r.err
 }
 
 func TestScopedWebhookIsolation(t *testing.T) {
@@ -119,22 +120,26 @@ func TestScopedWebhookIsolation(t *testing.T) {
 	payload := strings.Replace(jobPayload, "ushr-m4-42", runner, 1)
 	for _, tc := range []struct {
 		name, scope, host, secret string
-		revoked                   bool
+		revoked, lookupFails      bool
 		want                      int
 		status                    int
 	}{
-		{"org", "acme", "host", "tenant-secret", false, 1, http.StatusOK},
-		{"repo", "ACME/api", "host", "tenant-secret", false, 1, http.StatusOK},
-		{"other workspace", "other", "host", "tenant-secret", false, 0, http.StatusOK},
-		{"other repository", "acme/private", "host", "tenant-secret", false, 0, http.StatusOK},
-		{"other host", "acme", "other", "tenant-secret", false, 0, http.StatusOK},
-		{"wrong secret", "acme", "host", "other-secret", false, 0, http.StatusUnauthorized},
-		{"revoked host", "acme", "host", "tenant-secret", true, 0, http.StatusUnauthorized},
+		{"org", "acme", "host", "tenant-secret", false, false, 1, http.StatusOK},
+		{"repo", "ACME/api", "host", "tenant-secret", false, false, 1, http.StatusOK},
+		{"other workspace", "other", "host", "tenant-secret", false, false, 0, http.StatusOK},
+		{"other repository", "acme/private", "host", "tenant-secret", false, false, 0, http.StatusOK},
+		{"other host", "acme", "other", "tenant-secret", false, false, 0, http.StatusOK},
+		{"wrong secret", "acme", "host", "other-secret", false, false, 0, http.StatusUnauthorized},
+		{"revoked host", "acme", "host", "tenant-secret", true, false, 0, http.StatusUnauthorized},
+		{"lookup failure", "acme", "host", "tenant-secret", false, true, 0, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resolver := scopedResolver{scope: tc.scope, name: tc.host}
+			resolver := scopedResolver{secret: "tenant-secret", scope: tc.scope, name: tc.host}
 			if tc.revoked {
-				resolver.err = errors.New("revoked")
+				resolver.secret = ""
+			}
+			if tc.lookupFails {
+				resolver.err = errors.New("database unavailable")
 			}
 			var got []ledger.Record
 			handler := ScopedHandler(resolver, func(r ledger.Record) { got = append(got, r) })
