@@ -77,7 +77,8 @@ func run(configPath string) error {
 		return err
 	}
 
-	handler, err := withWebhook(srv.Routes(), cfg.Webhook, rec)
+	resolver, _ := enr.(webhook.Resolver)
+	handler, err := withWebhook(srv.Routes(), cfg.Webhook, rec, resolver)
 	if err != nil {
 		return err
 	}
@@ -150,8 +151,8 @@ func openStores(ctx context.Context, cfg *config.Controller) (dispatch.Store, en
 // API when a secret is configured. The webhook authenticates by HMAC signature,
 // so it sits outside the bearer-token middleware. Reaching it from GitHub is a
 // deployment concern (front the loopback controller with a tunnel/reverse proxy).
-func withWebhook(api http.Handler, cfg config.WebhookConfig, rec telemetry.Recorder) (http.Handler, error) {
-	if cfg.Secret == "" {
+func withWebhook(api http.Handler, cfg config.WebhookConfig, rec telemetry.Recorder, resolver webhook.Resolver) (http.Handler, error) {
+	if cfg.Secret == "" && resolver == nil {
 		return api, nil
 	}
 	path := ledger.PathOrDefault(cfg.LedgerPath)
@@ -170,7 +171,12 @@ func withWebhook(api http.Handler, cfg config.WebhookConfig, rec telemetry.Recor
 		rec.JobUpdated(r)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("POST /webhook", webhook.Handler([]byte(cfg.Secret), sink))
+	if cfg.Secret != "" {
+		mux.Handle("POST /webhook", webhook.Handler([]byte(cfg.Secret), sink))
+	}
+	if resolver != nil {
+		mux.Handle("POST /webhook/{id}", webhook.ScopedHandler(resolver, sink))
+	}
 	mux.Handle("/", api)
 	return mux, nil
 }

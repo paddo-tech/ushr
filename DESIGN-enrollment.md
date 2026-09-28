@@ -80,3 +80,33 @@ the PKCE verifier) — the standard session-park tradeoff.
 OSS single-host keeps the static-token (or loopback-no-token) path — no accounts,
 no Neon. Enrollment is the hosted/multi-tenant path, active only when the control
 plane is Neon-backed.
+
+## Hosted first-run setup
+
+The CLI reuses a valid enrollment when the customer runs `ushr login` again.
+The browser then guides GitHub App creation through `/setup/github`.
+This flow works when the browser and runner use different machines.
+
+The host creates a random setup ID and sends a verifier hash to `/api/runner-setup`.
+The web app binds that request to the enrolled host and a verified GitHub scope.
+A workspace administrator must approve the GitHub flow.
+The callback checks its stored state before recording GitHub's temporary exchange code.
+The host authenticates and presents its verifier to retrieve that code.
+Only the host exchanges the code for its private key.
+The control plane receives the webhook secret, but never the private key.
+
+The controller migration owns `runner_apps`.
+Each app receives a separate `/webhook/{id}` endpoint and secret.
+The receiver checks the signature, active enrollment, verified scope, and runner name.
+Revoking enrollment disables that app's telemetry access.
+Token renewal preserves the host's webhook connection within its workspace.
+
+The CLI saves setup progress locally with mode `0600`.
+A failed webhook registration leaves the saved key available for retry.
+The CLI verifies GitHub installation before starting the agent.
+The dashboard requires a heartbeat before showing machine readiness.
+It requires a successful GitHub result before showing onboarding completion.
+
+Deploy the controller migration before the web changes.
+Deploy the web changes before releasing the CLI.
+Verify signup, remote setup, retries, and the first workflow using a new workspace before public release.

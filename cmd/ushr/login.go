@@ -56,55 +56,71 @@ func runLogin(ctx context.Context, args []string) error {
 		return err
 	}
 
-	verifier, err := randToken()
-	if err != nil {
-		return fmt.Errorf("generate verifier: %w", err)
+	var creds sessionResult
+	if cfg.Token != "" && cfg.ControllerURL == *cp {
+		status, resumeErr := setupRequest(ctx, http.MethodGet, strings.TrimRight(*web, "/")+"/api/runner-setup", cfg.Token, nil, &creds)
+		if resumeErr != nil && status != http.StatusUnauthorized {
+			return resumeErr
+		}
+		if resumeErr == nil {
+			creds.Token = cfg.Token
+			fmt.Println("==> Resuming setup for", creds.AgentName)
+			if len(missingKeyScopes(cfg, creds.Orgs)) == 0 && confirm("    Change this host's GitHub access?", false, false) {
+				creds.Token = ""
+			}
+		}
 	}
-	session, err := randToken()
-	if err != nil {
-		return fmt.Errorf("generate session id: %w", err)
-	}
-	userCode, err := confirmCode()
-	if err != nil {
-		return fmt.Errorf("generate confirmation code: %w", err)
-	}
+	if creds.Token == "" {
+		verifier, err := randToken()
+		if err != nil {
+			return fmt.Errorf("generate verifier: %w", err)
+		}
+		session, err := randToken()
+		if err != nil {
+			return fmt.Errorf("generate session id: %w", err)
+		}
+		userCode, err := confirmCode()
+		if err != nil {
+			return fmt.Errorf("generate confirmation code: %w", err)
+		}
 
-	if err := postJSON(ctx, *cp+"/v1/cli/session", map[string]string{
-		"session_id": session,
-		"challenge":  enroll.Challenge(verifier),
-		"agent_name": agentName(*configPath),
-		"user_code":  userCode,
-	}); err != nil {
-		return fmt.Errorf("start login session: %w", err)
-	}
+		if err := postJSON(ctx, *cp+"/v1/cli/session", map[string]string{
+			"session_id": session,
+			"challenge":  enroll.Challenge(verifier),
+			"agent_name": agentName(*configPath),
+			"user_code":  userCode,
+		}); err != nil {
+			return fmt.Errorf("start login session: %w", err)
+		}
 
-	authURL := fmt.Sprintf("%s/cli/auth?session=%s", *web, session)
-	fmt.Println("==> Opening", authURL)
-	fmt.Println("    (headless box? open that URL on any device — phone, laptop)")
-	fmt.Println()
-	fmt.Println("==> Confirmation code:", userCode)
-	fmt.Println("    Approve only if the page shows this exact code.")
-	tryOpen(authURL)
-
-	fmt.Print("==> Waiting for approval")
-	creds, err := pollSession(ctx, *cp, session, verifier)
-	if err != nil {
+		authURL := fmt.Sprintf("%s/cli/auth?session=%s", *web, session)
+		fmt.Println("==> Opening", authURL)
+		fmt.Println("    (headless box? open that URL on any device — phone, laptop)")
 		fmt.Println()
-		return err
-	}
-	fmt.Println(" ✓")
+		fmt.Println("==> Confirmation code:", userCode)
+		fmt.Println("    Approve only if the page shows this exact code.")
+		tryOpen(authURL)
 
-	credPath := config.CredentialsPath(*configPath)
-	if err := config.WriteCredentials(credPath, config.Credentials{
-		ControllerURL: *cp,
-		Token:         creds.Token,
-		Name:          creds.AgentName,
-		Orgs:          creds.Orgs,
-	}); err != nil {
-		return fmt.Errorf("write credentials: %w", err)
+		fmt.Print("==> Waiting for approval")
+		creds, err = pollSession(ctx, *cp, session, verifier)
+		if err != nil {
+			fmt.Println()
+			return err
+		}
+		fmt.Println(" ✓")
+
+		credPath := config.CredentialsPath(*configPath)
+		if err := config.WriteCredentials(credPath, config.Credentials{
+			ControllerURL: *cp,
+			Token:         creds.Token,
+			Name:          creds.AgentName,
+			Orgs:          creds.Orgs,
+		}); err != nil {
+			return fmt.Errorf("write credentials: %w", err)
+		}
+		fmt.Printf("✓ Enrolled agent %q for org(s) %s\n", creds.AgentName, strings.Join(creds.Orgs, ", "))
+		fmt.Println("  Wrote", credPath)
 	}
-	fmt.Printf("✓ Enrolled agent %q for org(s) %s\n", creds.AgentName, strings.Join(creds.Orgs, ", "))
-	fmt.Println("  Wrote", credPath)
 
 	// Model B: the agent mints JIT runner configs with a GitHub App key it
 	// holds locally, so each enrolled org needs one on this host. Chain the
@@ -113,8 +129,18 @@ func runLogin(ctx context.Context, args []string) error {
 	for _, scope := range missingKeyScopes(cfg, creds.Orgs) {
 		fmt.Printf("\n==> %s has no GitHub App key on this host yet — creating one.\n", scope)
 		fmt.Println("    (each host runs its own GitHub App; hosts already serving this scope keep theirs)")
-		if err := appSetup(ctx, scope, *keyDir, *configPath, 100); err != nil {
+		if err := hostedAppSetup(ctx, scope, *keyDir, *configPath, *web, creds.Token); err != nil {
 			return fmt.Errorf("GitHub App setup for %s: %w", scope, err)
+		}
+	}
+
+	cfg, err = config.LoadAgent(*configPath)
+	if err != nil {
+		return err
+	}
+	for _, scope := range creds.Orgs {
+		if err := checkInstalled(ctx, cfg, scope); err != nil {
+			return err
 		}
 	}
 
@@ -130,7 +156,8 @@ func runLogin(ctx context.Context, args []string) error {
 		return fmt.Errorf("start agent service: %w", err)
 	}
 	fmt.Println()
-	fmt.Println("✓ ushr-agent service running")
+	fmt.Println("✓ Agent started. Waiting for its first heartbeat in the dashboard.")
+	fmt.Println("  Finish setup:      " + strings.TrimRight(*web, "/") + "/dashboard")
 	fmt.Printf("  Target jobs with:  runs-on: [%s]\n", strings.Join(cfg.Labels, ", "))
 	fmt.Println("  Check health:      ushr doctor")
 	fmt.Println("  Watch logs:        " + svc.LogHint(svc.Agent))
@@ -142,7 +169,7 @@ func runLogin(ctx context.Context, args []string) error {
 func missingKeyScopes(cfg *config.Agent, enrolled []string) []string {
 	var out []string
 	for _, e := range enrolled {
-		if _, ok := configuredTarget(cfg, e); !ok {
+		if _, _, ok := configuredTarget(cfg, e); !ok {
 			out = append(out, e)
 		}
 	}

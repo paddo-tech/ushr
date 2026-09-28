@@ -1,14 +1,17 @@
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/ledger"
 )
 
@@ -98,5 +101,55 @@ func TestStartedJobRecorded(t *testing.T) {
 	}
 	if got[0].StartedAt.IsZero() || !got[0].CompletedAt.IsZero() {
 		t.Fatalf("start timestamps: %+v", got[0])
+	}
+}
+
+type scopedResolver struct {
+	scope string
+	name  string
+	err   error
+}
+
+func (r scopedResolver) Webhook(context.Context, string) (string, string, string, error) {
+	return "tenant-secret", r.scope, r.name, r.err
+}
+
+func TestScopedWebhookIsolation(t *testing.T) {
+	runner := domain.RunnerName("host")
+	payload := strings.Replace(jobPayload, "ushr-m4-42", runner, 1)
+	for _, tc := range []struct {
+		name, scope, host, secret string
+		revoked                   bool
+		want                      int
+		status                    int
+	}{
+		{"org", "acme", "host", "tenant-secret", false, 1, http.StatusOK},
+		{"repo", "ACME/api", "host", "tenant-secret", false, 1, http.StatusOK},
+		{"other workspace", "other", "host", "tenant-secret", false, 0, http.StatusOK},
+		{"other repository", "acme/private", "host", "tenant-secret", false, 0, http.StatusOK},
+		{"other host", "acme", "other", "tenant-secret", false, 0, http.StatusOK},
+		{"wrong secret", "acme", "host", "other-secret", false, 0, http.StatusUnauthorized},
+		{"revoked host", "acme", "host", "tenant-secret", true, 0, http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := scopedResolver{scope: tc.scope, name: tc.host}
+			if tc.revoked {
+				resolver.err = errors.New("revoked")
+			}
+			var got []ledger.Record
+			handler := ScopedHandler(resolver, func(r ledger.Record) { got = append(got, r) })
+			req := httptest.NewRequest(http.MethodPost, "/webhook/connection", strings.NewReader(payload))
+			req.SetPathValue("id", "connection")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-GitHub-Event", "workflow_job")
+			mac := hmac.New(sha256.New, []byte(tc.secret))
+			_, _ = mac.Write([]byte(payload))
+			req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+			res := httptest.NewRecorder()
+			handler(res, req)
+			if res.Code != tc.status || len(got) != tc.want {
+				t.Fatalf("status=%d records=%d", res.Code, len(got))
+			}
+		})
 	}
 }

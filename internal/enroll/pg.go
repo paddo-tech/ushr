@@ -17,7 +17,22 @@ const opTimeout = 5 * time.Second
 // Append-only: never edit an entry that has shaped the live database. All
 // entries share ONE transaction, so statements that can't run in a tx block
 // (CREATE INDEX CONCURRENTLY, VACUUM) are off-limits here.
-var migrations = []string{schemaV1}
+var migrations = []string{schemaV1, schemaV2}
+
+const schemaV2 = `
+CREATE TABLE runner_apps (
+ id text PRIMARY KEY,
+ token_hash text NOT NULL REFERENCES agent_tokens(token_hash),
+ scope text NOT NULL,
+ challenge text NOT NULL,
+ state text NOT NULL,
+ code text,
+ expires_at timestamptz NOT NULL,
+ app_id bigint,
+ slug text,
+ webhook_secret text,
+ UNIQUE (token_hash, scope)
+);`
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS agent_tokens (
@@ -79,6 +94,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_tokens_active_account_name
 // It shares the control plane's pgxpool (see NewWithPool).
 type PG struct {
 	pool *pgxpool.Pool
+}
+
+// Webhook follows the host's live token, so rotation keeps the connection and revocation ends it.
+func (p *PG) Webhook(ctx context.Context, id string) (secret, scope, name string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	err = p.pool.QueryRow(ctx, `
+ SELECT a.webhook_secret, a.scope, t.name FROM runner_apps a
+ JOIN agent_tokens origin ON origin.token_hash = a.token_hash
+ JOIN agent_tokens t ON t.account_org_id = origin.account_org_id AND t.name = origin.name AND t.revoked_at IS NULL
+ JOIN org_installations o ON lower(o.github_org) = lower(a.scope) AND o.account_org_id = t.account_org_id
+ WHERE a.id = $1 AND a.webhook_secret IS NOT NULL
+ AND EXISTS (SELECT 1 FROM unnest(t.orgs) scope WHERE lower(scope) = lower(a.scope))`, id).Scan(&secret, &scope, &name)
+	return
 }
 
 var _ Store = (*PG)(nil)

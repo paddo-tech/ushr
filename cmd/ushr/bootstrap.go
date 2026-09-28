@@ -196,8 +196,7 @@ func preflightTart(ctx context.Context, image string, assumeYes bool) error {
 	fmt.Printf("    The %s base works out of the box (the agent installs the\n", cirrusBaseImage)
 	fmt.Println("    Actions runner into each clone). This is a large download (tens of GB).")
 	if !confirm(fmt.Sprintf("    Fetch it now with `tart clone %s %s`?", cirrusBaseImage, image), true, assumeYes) {
-		fmt.Println("    Skipping — jobs will fail until the image exists. Re-check with `ushr doctor`.")
-		return nil
+		return errors.New("setup paused: the runner image is required; run ushr login to resume")
 	}
 	if err := runStream(ctx, "tart", "clone", cirrusBaseImage, image); err != nil {
 		return fmt.Errorf("tart clone: %w", err)
@@ -252,7 +251,10 @@ func preflightDocker(ctx context.Context, drv config.DriverConfig, assumeYes boo
 		}
 		rt = "podman"
 	}
-	fmt.Printf("==> Container runtime: %s ✓\n", rt)
+	if err := exec.CommandContext(ctx, rt, "info").Run(); err != nil {
+		return fmt.Errorf("container runtime is not ready: start %s, then run ushr login again", rt)
+	}
+	fmt.Printf("==> Container runtime: %s ready ✓\n", rt)
 	if drv.BuildCache == nil || *drv.BuildCache {
 		if exec.CommandContext(ctx, rt, "buildx", "version").Run() != nil {
 			fmt.Println("    note: buildx plugin not found — builds run uncached until it's installed")

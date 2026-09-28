@@ -64,13 +64,16 @@ func runSetup(ctx context.Context, args []string) error {
 	// Every run of the manifest flow registers a real GitHub App; re-running
 	// setup for an already-configured scope should not silently mint another.
 	if cfg, err := config.LoadAgent(*configPath); err == nil {
-		if id, ok := configuredTarget(cfg, scope); ok && id != 0 {
+		if id, _, ok := configuredTarget(cfg, scope); ok && id != 0 {
 			fmt.Printf("==> %s is already configured (App id %d).\n", scope, id)
 			// -y keeps the existing App: assume-yes reruns are provisioning
 			// scripts, and auto-answering yes here would mint a duplicate
 			// GitHub App on every converge.
 			if *yes || !confirm("    Create ANOTHER GitHub App for it?", false, false) {
 				fmt.Println("    Keeping the existing App.")
+				if err := checkInstalled(ctx, cfg, scope); err != nil {
+					return err
+				}
 				return offerServices(*configPath, *yes)
 			}
 		}
@@ -223,24 +226,23 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 	}
 	fmt.Printf("==> Recorded %s (app id %d) in %s\n", scope, cfg.GetID(), configPath)
 
-	waitForAppInstall(ctx, cfg.GetID(), keyPath, scope, installURL)
-	return nil
+	return waitForAppInstall(ctx, cfg.GetID(), keyPath, scope, installURL)
 }
 
 // configuredTarget reports whether scope is recorded in the agent config, and
 // with which App id (0 = placeholder entry awaiting an App).
-func configuredTarget(cfg *config.Agent, scope string) (int64, bool) {
+func configuredTarget(cfg *config.Agent, scope string) (int64, string, bool) {
 	for _, o := range cfg.Orgs {
 		if strings.EqualFold(o.Name, scope) {
-			return o.AppID, true
+			return o.AppID, o.PrivateKeyPath, true
 		}
 	}
 	for _, r := range cfg.Repos {
 		if strings.EqualFold(r.Scope(), scope) {
-			return r.AppID, true
+			return r.AppID, r.PrivateKeyPath, true
 		}
 	}
-	return 0, false
+	return 0, "", false
 }
 
 type callback struct {

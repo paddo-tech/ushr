@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/google/go-github/v84/github"
-	"golang.org/x/term"
 
+	"github.com/paddo-tech/ushr/internal/config"
 	gh "github.com/paddo-tech/ushr/internal/source/github"
 )
 
@@ -24,58 +24,61 @@ func appInstalled(ctx context.Context, appID int64, key []byte, scope string) (b
 	return true, nil
 }
 
-func isNotInstalled(err error) bool {
+func githubStatus(err error) int {
 	var ghErr *github.ErrorResponse
-	return errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound
+	if errors.As(err, &ghErr) && ghErr.Response != nil {
+		return ghErr.Response.StatusCode
+	}
+	return 0
 }
 
-// waitForAppInstall polls until the App is installed on scope — an uninstalled
-// App can't mint runner configs, a failure that would otherwise surface only
-// in the agent log. Best-effort: on timeout it prints the install URL; doctor
-// re-checks later.
-func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, installURL string) {
+func isNotInstalled(err error) bool {
+	return githubStatus(err) == http.StatusNotFound
+}
+
+// The agent must not start for a scope its App cannot serve.
+func checkInstalled(ctx context.Context, cfg *config.Agent, scope string) error {
+	appID, keyPath, _ := configuredTarget(cfg, scope)
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
-		fmt.Printf("    Could not read %s to verify the install: %v\n", keyPath, err)
-		return
+		return err
 	}
-	giveUp := func() {
-		fmt.Printf("    App not installed on %s yet — runners can't start until it is.\n", scope)
-		fmt.Println("    Finish here, then check with `ushr doctor`:")
-		fmt.Println("    " + installURL)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := appInstalled(ctx, appID, key, scope); err != nil {
+		return fmt.Errorf("GitHub app is not ready for %s: %w", scope, err)
 	}
-	check := func() bool {
-		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		ok, _ := appInstalled(checkCtx, appID, key, scope)
-		return ok
+	return nil
+}
+
+// An uninstalled app must not advance setup to agent startup.
+func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, installURL string) error {
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		return err
 	}
-	// No TTY means no browser to finish the install step — check once and
-	// hand off to doctor instead of polling for minutes.
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		if check() {
-			fmt.Printf("==> App installed on %s ✓\n", scope)
-		} else {
-			giveUp()
-		}
-		return
-	}
-	fmt.Print("==> Waiting for the App to be installed (finish the browser step)")
+	fmt.Println("==> Waiting for GitHub installation. Continue in your browser.")
 	waitCtx, cancel := context.WithTimeout(ctx, appSetupTimeout)
 	defer cancel()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
-		if check() {
-			fmt.Println(" ✓")
-			return
+		checkCtx, checkCancel := context.WithTimeout(waitCtx, 10*time.Second)
+		ok, err := appInstalled(checkCtx, appID, key, scope)
+		timedOut := checkCtx.Err() != nil
+		checkCancel()
+		if ok {
+			fmt.Println("==> GitHub app installed on", scope)
+			return nil
 		}
-		fmt.Print(".")
+		// Slow, rate-limited, and failing GitHub checks retry; only a definite rejection stops setup.
+		status := githubStatus(err)
+		if err != nil && !timedOut && status != http.StatusNotFound && status != http.StatusTooManyRequests && status < 500 {
+			return fmt.Errorf("check GitHub installation: %w", err)
+		}
 		select {
 		case <-waitCtx.Done():
-			fmt.Println()
-			giveUp()
-			return
+			return fmt.Errorf("GitHub installation is unfinished: %s; run ushr login to resume", installURL)
 		case <-tick.C:
 		}
 	}

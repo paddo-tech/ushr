@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/paddo-tech/ushr/internal/dispatch"
+	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/enroll"
 	"github.com/paddo-tech/ushr/internal/telemetry"
 )
@@ -603,5 +604,13 @@ func TestUpdateTargetPolicy(t *testing.T) {
 				t.Fatal("missing request identifier")
 			}
 		})
+	}
+}
+
+func TestRunnerNamesFitLongestEnrolledHost(t *testing.T) {
+	host := strings.Repeat("a", 32)
+	first, second := domain.RunnerName(host), domain.RunnerName(host)
+	if len(first) > 64 || first == second || !strings.HasPrefix(first, "ushr-"+host+"-") {
+		t.Fatalf("invalid runner names: %q, %q", first, second)
 	}
 }

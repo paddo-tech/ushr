@@ -11,9 +11,12 @@ import (
 // RunnerNamePrefix identifies jobs served by this fleet.
 const RunnerNamePrefix = "ushr-"
 
+// RunnerNameSuffixLength leaves room for a 32-character host in GitHub’s 64-character runner name.
+const RunnerNameSuffixLength = 26
+
 // RunnerName identifies an attempt; retries must never overwrite an earlier attempt's telemetry.
 func RunnerName(agent string) string {
-	var nonce [16]byte
+	var nonce [RunnerNameSuffixLength / 2]byte
 	_, _ = rand.Read(nonce[:])
 	return RunnerNamePrefix + agent + "-" + hex.EncodeToString(nonce[:])
 }

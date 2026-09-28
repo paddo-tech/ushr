@@ -2,6 +2,7 @@
 package webhook
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -12,9 +13,32 @@ import (
 	"github.com/paddo-tech/ushr/internal/ledger"
 )
 
+type Resolver interface {
+	Webhook(context.Context, string) (secret, scope, name string, err error)
+}
+
+// ScopedHandler binds each app secret to its verified scope and enrolled host.
+func ScopedHandler(resolver Resolver, sink func(ledger.Record)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		secret, scope, name, err := resolver.Webhook(r.Context(), r.PathValue("id"))
+		if err != nil || secret == "" {
+			http.Error(w, "unknown connection", http.StatusUnauthorized)
+			return
+		}
+		Handler([]byte(secret), func(record ledger.Record) {
+			matchesScope := strings.EqualFold(scope, record.Org) || strings.EqualFold(scope, record.Org+"/"+record.Repo)
+			prefix := domain.RunnerNamePrefix + name + "-"
+			if matchesScope && strings.HasPrefix(record.RunnerName, prefix) && len(record.RunnerName) == len(prefix)+domain.RunnerNameSuffixLength {
+				sink(record)
+			}
+		})(w, r)
+	}
+}
+
 // Handler accepts signed start and completion events for fleet runners.
 func Handler(secret []byte, sink func(ledger.Record)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 		payload, err := github.ValidatePayload(r, secret)
 		if err != nil {
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
