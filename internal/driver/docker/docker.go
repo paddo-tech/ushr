@@ -367,6 +367,17 @@ func (d *Driver) ReclaimTiers(ctx context.Context) []driver.Tier {
 	if !d.exclusive {
 		return tiers
 	}
+	if d.runtime == "docker" {
+		// Jobs without a repo (scale-set demand) and jobs that bypass their
+		// per-repo builder build on the daemon's default builder, which
+		// pruneBuilders never sees. Buildkit prunes under lease, so no drain.
+		// --keep-storage, not --reserved-space: native `builder prune` and
+		// older buildx accept only the former. Podman has no `builder prune`.
+		tiers = append(tiers, driver.Tier{Name: "default build cache", Run: func() error {
+			return d.docker(ctx, "builder", "prune", "-f",
+				fmt.Sprintf("--keep-storage=%dGB", max(d.buildCacheGB/pressureCacheDivisor, 1)))
+		}})
+	}
 	return append(tiers,
 		// `until` filters on creation time, not last use, so it can't express
 		// "idle for an hour" — the drain is what makes these safe, not a filter.
