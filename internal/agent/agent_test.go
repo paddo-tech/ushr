@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/paddo-tech/ushr/internal/api"
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/domain"
@@ -173,6 +175,15 @@ func TestRunHappyPath(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not exit on cancel")
 	}
+	if got := testutil.ToFloat64(a.Metrics.SlotsTotal); got != 1 {
+		t.Errorf("slots total = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(a.Metrics.SlotsBusy); got != 0 {
+		t.Errorf("slots busy after completion = %v, want 0", got)
+	}
+	if got := testutil.CollectAndCount(a.Metrics.Registry, "ushr_agent_provision_duration_seconds"); got != 1 {
+		t.Errorf("provision duration series = %d, want 1", got)
+	}
 }
 
 // A host whose image store is under the floor must keep polling — the
@@ -214,6 +225,33 @@ func TestPollReportsBlockedBelowDiskFloor(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("agent never polled")
 	}
+	if got := testutil.ToFloat64(a.Metrics.DiskBlocked); got != 1 {
+		t.Fatalf("disk blocked gauge = %v, want 1", got)
+	}
+}
+
+func TestPollErrorsCounted(t *testing.T) {
+	failed := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case failed <- struct{}{}:
+		default:
+		}
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	a := New("t1", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+
+	select {
+	case <-failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent never polled")
+	}
+	waitFor(t, "poll error counted", func() bool { return testutil.ToFloat64(a.Metrics.PollErrors) == 1 })
 }
 
 // Nothing but running a job clears a queue entry, so anything the control

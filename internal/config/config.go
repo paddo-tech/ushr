@@ -139,6 +139,9 @@ type Agent struct {
 	// Repos serves individual repositories (personal-account / per-repo runners).
 	Repos  []RepoTarget `yaml:"repos"`
 	Source SourceConfig `yaml:"source"`
+	// MetricsListen serves Prometheus metrics at /metrics on this address, with
+	// no auth. Empty (the default) serves nothing.
+	MetricsListen string `yaml:"metrics_listen"`
 }
 
 type DriverConfig struct {

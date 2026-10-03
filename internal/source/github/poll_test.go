@@ -26,7 +26,7 @@ func TestNew_Validation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := New(context.Background(), c.auths, c.interval)
+			_, err := New(context.Background(), c.auths, c.interval, nil)
 			if (err != nil) != c.wantErr {
 				t.Errorf("err=%v wantErr=%v", err, c.wantErr)
 			}

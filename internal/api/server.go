@@ -17,6 +17,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/enroll"
+	"github.com/paddo-tech/ushr/internal/metrics"
 	"github.com/paddo-tech/ushr/internal/telemetry"
 	"github.com/paddo-tech/ushr/internal/version"
 )
@@ -65,9 +66,12 @@ type Server struct {
 	// for a shared NAT.
 	fetchLimiter *ipLimiter
 
+	metrics *metrics.Controller
+
 	mu       sync.Mutex
 	lastSeen map[string]time.Time
-	now      func() time.Time // test seam
+	reported map[string][]string // job keys in each live agent's latest poll
+	now      func() time.Time    // test seam
 }
 
 // WithTelemetry swaps in a live Recorder (hosted control plane). Call before
@@ -94,8 +98,10 @@ func NewServer(boostPerMinute int, token string, led dispatch.Store, enr enroll.
 		sessionLimiter: newIPLimiter(10, time.Minute),
 		fetchLimiter:   newIPLimiter(120, time.Minute),
 		lastSeen:       make(map[string]time.Time),
+		reported:       make(map[string][]string),
 		now:            time.Now,
 	}
+	s.metrics = metrics.NewController(s.activeAgents, s.queuedJobs)
 	// Claimed records recovered from the WAL belong to agents this process has
 	// never heard from. Count recovery as contact so the liveness sweep applies
 	// to them uniformly: a dead agent's claims resolve lost after agentDeadAfter
@@ -158,7 +164,31 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.Handle("GET /metrics", s.metrics.Handler())
 	return s.authMiddleware(mux)
+}
+
+// metricsAllowed gates /metrics. The series are fleet-wide, so an enrolled
+// agent token, which is scoped to one tenant, must not read them. A static
+// token is the operator's own key and unlocks them. Without one (loopback OSS
+// and the enrolled hosted plane) only a direct loopback peer may scrape; a
+// proxy-forwarding header means a tunnel or edge relayed an outside request.
+func (s *Server) metricsAllowed(r *http.Request) bool {
+	if s.token != "" {
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+	}
+	for _, h := range []string{"X-Forwarded-For", "Forwarded", "Fly-Client-IP"} {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -167,6 +197,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		// Health and the pre-login handshake are unauthenticated (the CLI has no
 		// token yet; the handshake is gated by session entropy + the PKCE verifier).
 		if p == "/healthz" || strings.HasPrefix(p, "/v1/cli/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if p == "/metrics" {
+			if !s.metricsAllowed(r) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -357,6 +395,7 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		req.Queues = queuesForOrgs(req.Queues, orgs)
 	}
 	s.heartbeat(livenessKey(orgs, name))
+	s.recordReported(livenessKey(orgs, name), req.Queues)
 	// Queue depth is recorded before the free-capacity check below: a blocked
 	// agent's report is dropped for scheduling, but it is the only evidence that
 	// work exists on a host that can't take it, which is what makes a fleet-wide
@@ -395,11 +434,16 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	// window while the agent's other jobs wait. Bounded so a flood of racing
 	// reports can't spin the offer path.
 	for attempt := 0; attempt < maxOfferAttempts; attempt++ {
-		best, ok := s.pick(name, orgs, req, live)
+		best, waited, ok := s.pick(name, orgs, req, live)
 		if !ok {
 			break
 		}
 		err := s.ledger.Offer(best)
+		// A failed WAL append still leaves the offer live, so it counts too.
+		if !errors.Is(err, dispatch.ErrDuplicate) {
+			s.metrics.Offers.Inc()
+			s.metrics.DispatchLatency.Observe(float64(waited))
+		}
 		if err == nil {
 			s.telemetry.Event(best.Pending.Org, best.ID, "offered",
 				map[string]any{"agent": best.Agent, "job_id": best.Pending.JobID})
@@ -437,10 +481,12 @@ func writeOffer(w http.ResponseWriter, best dispatch.Record) {
 // in the live set (already offered/claimed, or raced this poll). Score is the
 // org's priority (policy value, else agent-reported) plus aging from wait time; ties break toward the
 // longer-waiting job. orgs is the token's tenant set (empty for the unscoped
-// static token), used to namespace the record's liveness identity.
-func (s *Server) pick(name string, orgs []string, req PollRequest, live map[string]bool) (dispatch.Record, bool) {
+// static token), used to namespace the record's liveness identity. It also
+// returns the chosen job's clamped wait in seconds.
+func (s *Server) pick(name string, orgs []string, req PollRequest, live map[string]bool) (dispatch.Record, int, bool) {
 	var best dispatch.Record
 	var bestJob QueuedJob
+	bestWait := 0
 	bestScore := math.MinInt
 	found := false
 	for _, q := range req.Queues {
@@ -460,7 +506,7 @@ func (s *Server) pick(name string, orgs []string, req PollRequest, live map[stri
 			if !better {
 				continue
 			}
-			found, bestScore, bestJob = true, score, j
+			found, bestScore, bestJob, bestWait = true, score, j, waited
 			best = dispatch.Record{
 				ID:        domain.RunnerName(name),
 				Agent:     livenessKey(orgs, name),
@@ -469,7 +515,7 @@ func (s *Server) pick(name string, orgs []string, req PollRequest, live map[stri
 			}
 		}
 	}
-	return best, found
+	return best, bestWait, found
 }
 
 // liveJobs is the set of (org, job_id) already offered or claimed, so a
@@ -540,6 +586,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "offer gone", http.StatusGone)
 		return
 	}
+	s.metrics.Claims.Inc()
 	s.telemetry.Event(rec.Pending.Org, id, "claimed",
 		map[string]any{"agent": rec.Agent, "job_id": rec.Pending.JobID})
 	// No mint here — the agent holds the key and mints the JIT itself.
@@ -591,6 +638,51 @@ func (s *Server) heartbeat(key string) {
 	s.mu.Lock()
 	s.lastSeen[key] = s.now()
 	s.mu.Unlock()
+}
+
+func (s *Server) recordReported(key string, queues []OrgQueue) {
+	keys := make([]string, 0, queueDepth(queues))
+	for _, q := range queues {
+		for _, j := range q.Jobs {
+			keys = append(keys, jobKey(q.Org, j.JobID))
+		}
+	}
+	s.mu.Lock()
+	s.reported[key] = keys
+	s.mu.Unlock()
+}
+
+// activeAgents reads the deadline itself: the sweep that prunes lastSeen runs
+// only on a poll, so a fleet that stops polling would otherwise read as live.
+func (s *Server) activeAgents() float64 {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, seen := range s.lastSeen {
+		if now.Sub(seen) <= agentDeadAfter {
+			n++
+		}
+	}
+	return float64(n)
+}
+
+// queuedJobs counts each job once even when several agents of one org report
+// it, and skips agents past the liveness deadline.
+func (s *Server) queuedJobs() float64 {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jobs := make(map[string]struct{})
+	for agent, keys := range s.reported {
+		if now.Sub(s.lastSeen[agent]) > agentDeadAfter {
+			continue
+		}
+		for _, k := range keys {
+			jobs[k] = struct{}{}
+		}
+	}
+	return float64(len(jobs))
 }
 
 // recordResolved emits the terminal-telemetry pair — history row + live event
@@ -657,10 +749,12 @@ func (s *Server) sweep(snapshot []dispatch.Record) []dispatch.Record {
 	for k, seen := range s.lastSeen {
 		if now.Sub(seen) > agentDeadAfter && !retry[k] {
 			delete(s.lastSeen, k)
+			delete(s.reported, k)
 			lost = append(lost, k)
 		}
 	}
 	s.mu.Unlock()
+	s.metrics.AgentsLost.Add(float64(len(lost)))
 	for _, k := range lost {
 		// The liveness key is "{org}/{name}" for enrolled agents, where org may
 		// itself be an "owner/repo" scope — the name is after the LAST slash.

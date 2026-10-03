@@ -6,10 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/paddo-tech/ushr/internal/agent"
 	"github.com/paddo-tech/ushr/internal/api"
@@ -17,6 +20,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver/factory"
 	"github.com/paddo-tech/ushr/internal/jit"
+	"github.com/paddo-tech/ushr/internal/metrics"
 	gh "github.com/paddo-tech/ushr/internal/source/github"
 	"github.com/paddo-tech/ushr/internal/source/scaleset"
 	"github.com/paddo-tech/ushr/internal/update"
@@ -77,13 +81,21 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	jobs, minter, prio, err := newSource(ctx, cfg)
+	m := metrics.NewAgent(string(cfg.Driver.Type))
+	if cfg.MetricsListen != "" {
+		if err := serveMetrics(ctx, cfg.MetricsListen, m); err != nil {
+			return err
+		}
+	}
+
+	jobs, minter, prio, err := newSource(ctx, cfg, m)
 	if err != nil {
 		return err
 	}
 
 	client := api.NewClient(cfg.ControllerURL, cfg.Token)
 	a := agent.New(cfg.Name, cfg.Labels, drv, client, minter, prio, jobs)
+	a.Metrics = m
 	a.Version = version.Version
 	a.Update = update.Prepare
 	a.Healthy = update.Healthy
@@ -103,7 +115,7 @@ func run(configPath string) error {
 // config. Model B: the agent — not the control plane — holds the App keys,
 // watches GitHub (poll or scale-set message sessions), and mints. An unset
 // type defaults to poll.
-func newSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Job, agent.Minter, map[string]int, error) {
+func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan domain.Job, agent.Minter, map[string]int, error) {
 	switch cfg.Source.Type {
 	case config.SourceTypePoll, "":
 	case config.SourceTypeScaleSet:
@@ -132,7 +144,7 @@ func newSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Job, agent
 			return nil, nil, nil, err
 		}
 	}
-	source, err := gh.New(ctx, auths, cfg.Source.Interval)
+	source, err := gh.New(ctx, auths, cfg.Source.Interval, m)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -159,4 +171,27 @@ func newScaleSetSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Jo
 	}
 	jobs, err := src.Subscribe(ctx)
 	return jobs, src, prio, err
+}
+
+// serveMetrics binds before returning so a bad address fails startup loudly,
+// then serves until ctx ends.
+func serveMetrics(ctx context.Context, addr string, m *metrics.Agent) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("metrics listen: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	go func() {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server stopped", "err", err)
+		}
+	}()
+	slog.Info("serving metrics", "addr", addr)
+	return nil
 }
