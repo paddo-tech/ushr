@@ -16,6 +16,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/disk"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
+	"github.com/paddo-tech/ushr/internal/metrics"
 	"github.com/paddo-tech/ushr/internal/update"
 	"github.com/paddo-tech/ushr/internal/version"
 )
@@ -117,6 +118,10 @@ type Agent struct {
 	// collected. Zero disables reclaim.
 	ReclaimFloor uint64
 
+	// Metrics receives the agent's series; served only when the operator sets
+	// a metrics listen address.
+	Metrics *metrics.Agent
+
 	minter      Minter
 	orgPriority map[string]int
 	jobs        <-chan domain.Job // pending jobs polled from GitHub
@@ -155,6 +160,7 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		Labels:      labels,
 		Driver:      drv,
 		Client:      client,
+		Metrics:     metrics.NewAgent(""),
 		minter:      minter,
 		orgPriority: orgPriority,
 		jobs:        jobs,
@@ -207,6 +213,7 @@ func (a *Agent) ReconcileOrphans(ctx context.Context) error {
 // clean up before returning.
 func (a *Agent) Run(ctx context.Context) error {
 	slog.Info("agent starting", "name", a.Name, "capacity", a.Driver.Capacity(), "labels", a.Labels)
+	a.Metrics.SlotsTotal.Set(float64(a.Driver.Capacity()))
 	defer a.wg.Wait()
 	target, request := "", ""
 	var updateDone chan error
@@ -280,6 +287,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				continue // woken by new work — re-poll immediately with it
 			}
 			slog.Warn("poll failed", "err", err)
+			a.Metrics.PollErrors.Inc()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -600,7 +608,13 @@ func (a *Agent) gateState(ctx context.Context) (disk.Usage, bool) {
 			slog.Info("image store recovered, accepting dispatches", "free_gb", u.Free>>30)
 		}
 	}
-	return u, blocked || a.draining.Load()
+	blocked = blocked || a.draining.Load()
+	if blocked {
+		a.Metrics.DiskBlocked.Set(1)
+	} else {
+		a.Metrics.DiskBlocked.Set(0)
+	}
+	return u, blocked
 }
 
 // declineReason names why this host can't take a dispatch right now, "" when it
@@ -659,6 +673,7 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 	}
 
 	slog.Info("dispatch received", "id", o.ID, "org", o.Org)
+	start := time.Now()
 	handle, err := a.Driver.Provision(ctx, driver.ProvisionRequest{
 		Name:     o.ID,
 		Org:      o.Org,
@@ -668,11 +683,13 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 	})
 	if err != nil {
 		slog.Error("provision failed", "id", o.ID, "err", err)
+		a.Metrics.ProvisionFailures.Inc()
 		a.undispatch(o.JobID)
 		a.reportBudgeted(ctx, o.ID, api.DoneRequest{Status: "failed", Error: err.Error()})
 		a.backoff(ctx)
 		return
 	}
+	a.Metrics.ProvisionSeconds.Observe(time.Since(start).Seconds())
 	slog.Info("provisioned", "id", o.ID, "handle", handle)
 	a.waitForDone(ctx, handle)
 
@@ -871,11 +888,13 @@ func (a *Agent) busyHandles() []string {
 func (a *Agent) markBusy(h string) {
 	a.mu.Lock()
 	a.busy[h] = struct{}{}
+	a.Metrics.SlotsBusy.Set(float64(len(a.busy)))
 	a.mu.Unlock()
 }
 
 func (a *Agent) markFree(h string) {
 	a.mu.Lock()
 	delete(a.busy, h)
+	a.Metrics.SlotsBusy.Set(float64(len(a.busy)))
 	a.mu.Unlock()
 }

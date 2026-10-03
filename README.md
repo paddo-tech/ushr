@@ -73,6 +73,48 @@ Point the webhook at `/webhook` on the control plane and subscribe to **Workflow
 Start events supply live job links. Completion events supply workflow names, results, and execution times.
 The dashboard identifies missing results and estimated slot durations.
 
+## Metrics
+
+The controller and the agent export Prometheus metrics at `/metrics`.
+
+The controller serves `/metrics` on its normal listener.
+With a static token (`USHR_TOKEN`), a scrape must send `Authorization: Bearer <token>`.
+Without a static token, only a direct loopback peer can scrape.
+The controller refuses scrapes that carry `X-Forwarded-For`, `Forwarded` or `Fly-Client-IP`.
+Enrolled agent tokens never unlock `/metrics`, because the series cover every tenant.
+
+| Controller series | Type | Meaning |
+|---|---|---|
+| `ushr_controller_offers_total` | counter | Dispatch offers made to agents |
+| `ushr_controller_claims_total` | counter | Offers that agents claimed |
+| `ushr_controller_dispatch_latency_seconds` | histogram | Job wait from GitHub queue to offer, from the agent-reported wait |
+| `ushr_controller_agents_lost_total` | counter | Agents dropped after missed polls |
+| `ushr_controller_agents_active` | gauge | Agents heard from within the liveness window |
+| `ushr_controller_queued_jobs_seen` | gauge | Distinct queued jobs in the latest poll of each active agent |
+
+The agent serves no metrics by default.
+Set `metrics_listen` in `agent.yaml` to serve them:
+
+```yaml
+metrics_listen: 127.0.0.1:9464
+```
+
+The agent listener has no auth. Bind it to loopback or a private interface.
+
+| Agent series | Type | Labels | Meaning |
+|---|---|---|---|
+| `ushr_agent_slots_busy` | gauge | | Slots reserved or running a job |
+| `ushr_agent_slots_total` | gauge | | Slots the driver offers |
+| `ushr_agent_provision_duration_seconds` | histogram | `driver` | Time to provision a runner, successes only |
+| `ushr_agent_provision_failures_total` | counter | `driver` | Provision attempts that failed |
+| `ushr_agent_disk_blocked` | gauge | | 1 while the disk gate or a reclaim drain refuses work |
+| `ushr_agent_github_api_errors_total` | counter | `org` | Failed GitHub API calls by the poll source |
+| `ushr_agent_github_breaker_open` | gauge | `org` | 1 while the poll source pauses an org |
+| `ushr_agent_poll_errors_total` | counter | | Failed polls to the controller |
+
+The GitHub series come from the `poll` source only. The `scaleset` source does not export them.
+Both processes also export the standard Go runtime and process series.
+
 ## Development
 
 ```bash
@@ -93,9 +135,9 @@ go run ./cmd/integration-test -trigger-repo=example-repo
 Shipped: Tart / Lume / Docker / SSH drivers, polling and scaleset sources,
 priority + aging, multi-host, two-phase keyless dispatch, per-agent enrollment,
 persistent dispatch ledger, `ushr cost`, one-command host setup, disk-pressure
-gating and reclaim.
+gating and reclaim, Prometheus metrics.
 
-Next: Kubernetes driver, Prometheus metrics, docs site.
+Next: Kubernetes driver, docs site.
 
 ## Auth model
 

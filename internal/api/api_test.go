@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/enroll"
@@ -413,7 +415,7 @@ func TestPickSkipsLiveJob(t *testing.T) {
 	s := NewServer(0, "", memLedger(t), nil)
 	req := PollRequest{Capacity: 1, Labels: []string{"self-hosted"}, Queues: oneJob("paddo-tech", 7, 0, "self-hosted")}
 
-	rec, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot()))
+	rec, _, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot()))
 	if !ok {
 		t.Fatal("first pick should offer job 7")
 	}
@@ -421,7 +423,7 @@ func TestPickSkipsLiveJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Same job re-reported (by this or another agent) must not be picked again.
-	if _, ok := s.pick("agent-2", nil, req, liveJobs(s.ledger.Snapshot())); ok {
+	if _, _, ok := s.pick("agent-2", nil, req, liveJobs(s.ledger.Snapshot())); ok {
 		t.Fatal("a job already live must not be re-offered")
 	}
 }
@@ -430,7 +432,7 @@ func TestPickLabelFilter(t *testing.T) {
 	s := NewServer(0, "", memLedger(t), nil)
 	req := PollRequest{Capacity: 1, Labels: []string{"self-hosted", "Linux"},
 		Queues: oneJob("paddo-tech", 7, 0, "self-hosted", "Linux", "X64")}
-	if _, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot())); ok {
+	if _, _, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot())); ok {
 		t.Fatal("job requiring X64 must not match an agent without it")
 	}
 }
@@ -441,7 +443,7 @@ func TestPickPriorityOrder(t *testing.T) {
 		{Org: "low", Priority: 0, Jobs: []QueuedJob{{JobID: 1, Labels: []string{"self-hosted"}, WaitingSecs: 0}}},
 		{Org: "high", Priority: 5, Jobs: []QueuedJob{{JobID: 2, Labels: []string{"self-hosted"}, WaitingSecs: 0}}},
 	}}
-	rec, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot()))
+	rec, _, ok := s.pick("agent-1", nil, req, liveJobs(s.ledger.Snapshot()))
 	if !ok || rec.Pending.JobID != 2 {
 		t.Fatalf("expected the higher-priority job 2, got %+v ok=%v", rec, ok)
 	}
@@ -612,5 +614,107 @@ func TestRunnerNamesFitLongestEnrolledHost(t *testing.T) {
 	first, second := domain.RunnerName(host), domain.RunnerName(host)
 	if len(first) > 64 || first == second || !strings.HasPrefix(first, "ushr-"+host+"-") {
 		t.Fatalf("invalid runner names: %q, %q", first, second)
+	}
+}
+
+func scrape(t *testing.T, url, token string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body bytes.Buffer
+	_, _ = body.ReadFrom(resp.Body)
+	return resp.StatusCode, body.String()
+}
+
+func TestMetricsCountOffersAndClaims(t *testing.T) {
+	srv := httptest.NewServer(NewServer(0, "secret", memLedger(t), nil).Routes())
+	defer srv.Close()
+	c := NewClient(srv.URL, "secret")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	o, err := c.Poll(ctx, "agent-1", PollRequest{Capacity: 1, Labels: []string{"self-hosted"},
+		Queues: oneJob("o", 7, 90, "self-hosted")})
+	if err != nil || o == nil {
+		t.Fatalf("poll: err=%v offer=%v", err, o)
+	}
+	if err := c.Claim(ctx, "agent-1", o.ID); err != nil {
+		t.Fatal(err)
+	}
+	code, body := scrape(t, srv.URL, "secret")
+	if code != http.StatusOK {
+		t.Fatalf("scrape status %d", code)
+	}
+	for _, want := range []string{
+		"ushr_controller_offers_total 1\n",
+		"ushr_controller_claims_total 1\n",
+		"ushr_controller_agents_active 1\n",
+		"ushr_controller_queued_jobs_seen 1\n",
+		"ushr_controller_dispatch_latency_seconds_bucket{le=\"60\"} 0\n",
+		"ushr_controller_dispatch_latency_seconds_bucket{le=\"120\"} 1\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape missing %q", want)
+		}
+	}
+}
+
+func TestMetricsAuth(t *testing.T) {
+	srv := httptest.NewServer(NewServer(0, "secret", memLedger(t), nil).Routes())
+	defer srv.Close()
+	if code, _ := scrape(t, srv.URL, ""); code != http.StatusUnauthorized {
+		t.Fatalf("static-token server served metrics without the token: %d", code)
+	}
+
+	s := NewServer(0, "", memLedger(t), newFakeEnroll())
+	cases := []struct {
+		name   string
+		remote string
+		header string
+		want   bool
+	}{
+		{"loopback peer", "127.0.0.1:5000", "", true},
+		{"remote peer", "203.0.113.5:5000", "", false},
+		{"loopback relay of a remote request", "127.0.0.1:5000", "X-Forwarded-For", false},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		r.RemoteAddr = tc.remote
+		if tc.header != "" {
+			r.Header.Set(tc.header, "203.0.113.5")
+		}
+		if got := s.metricsAllowed(r); got != tc.want {
+			t.Errorf("%s: allowed=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSweepCountsLostAgents(t *testing.T) {
+	led := memLedger(t)
+	s := NewServer(0, "", led, nil)
+	base := time.Now()
+	s.now = func() time.Time { return base }
+	s.heartbeat("idle-agent")
+	s.recordReported("idle-agent", oneJob("o", 7, 0))
+	base = base.Add(agentDeadAfter + time.Second)
+	if got := s.activeAgents(); got != 0 {
+		t.Fatalf("an agent past the deadline still counts before the sweep: active = %v", got)
+	}
+	s.sweep(led.Snapshot())
+	if got := testutil.ToFloat64(s.metrics.AgentsLost); got != 1 {
+		t.Fatalf("agents lost = %v, want 1", got)
+	}
+	if got := s.queuedJobs(); got != 0 {
+		t.Fatalf("a lost agent's report still counts: queued = %v", got)
 	}
 }

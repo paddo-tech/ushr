@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-github/v84/github"
 
 	"github.com/paddo-tech/ushr/internal/domain"
+	"github.com/paddo-tech/ushr/internal/metrics"
 	"github.com/paddo-tech/ushr/internal/source"
 )
 
@@ -44,6 +45,8 @@ type Poller struct {
 	// breakers pause a misbehaving org's polling; keyed by org, accessed only
 	// from the poll goroutine.
 	breakers map[string]*breaker
+
+	metrics *metrics.Agent
 
 	mu sync.Mutex
 	// seen dedups emitted jobs by job ID (value = when last emitted, for the
@@ -96,8 +99,9 @@ func newBreakers(clients []orgClient) map[string]*breaker {
 var _ source.Source = (*Poller)(nil)
 
 // New authenticates as each AppAuth's installation and constructs a Poller.
-// interval must be > 0; auths must be non-empty.
-func New(ctx context.Context, auths []AppAuth, interval time.Duration) (*Poller, error) {
+// interval must be > 0; auths must be non-empty. m receives the per-org API
+// error and breaker series.
+func New(ctx context.Context, auths []AppAuth, interval time.Duration, m *metrics.Agent) (*Poller, error) {
 	if interval <= 0 {
 		return nil, fmt.Errorf("interval must be > 0, got %s", interval)
 	}
@@ -116,6 +120,7 @@ func New(ctx context.Context, auths []AppAuth, interval time.Duration) (*Poller,
 		clients:  clients,
 		interval: interval,
 		breakers: newBreakers(clients),
+		metrics:  m,
 		seen:     make(map[int64]time.Time),
 		seenRuns: make(map[int64]runState),
 	}, nil
@@ -128,6 +133,7 @@ func newWithClients(clients []orgClient, interval time.Duration) *Poller {
 		clients:  clients,
 		interval: interval,
 		breakers: newBreakers(clients),
+		metrics:  metrics.NewAgent(""),
 		seen:     make(map[int64]time.Time),
 		seenRuns: make(map[int64]runState),
 	}
@@ -166,12 +172,25 @@ func (p *Poller) pollAll(ctx context.Context, out chan<- domain.Job) {
 			return
 		}
 		b := p.breakers[c.scope()]
+		if b.ready(time.Now()) {
+			if err := p.pollOrg(ctx, c, b, out); err != nil {
+				slog.Warn("poll target failed", "scope", c.scope(), "err", err)
+			}
+		}
+		open := 0.0
 		if !b.ready(time.Now()) {
-			continue
+			open = 1
 		}
-		if err := p.pollOrg(ctx, c, b, out); err != nil {
-			slog.Warn("poll target failed", "scope", c.scope(), "err", err)
-		}
+		p.metrics.BreakerOpen.WithLabelValues(c.scope()).Set(open)
+		p.metrics.GitHubAPIErrors.WithLabelValues(c.scope()) // export 0 before the first error
+	}
+}
+
+// observe feeds one API outcome to the org's breaker and counts it if it failed.
+func (p *Poller) observe(c orgClient, b *breaker, err error, resp *github.Response) {
+	b.observe(time.Now(), err, resp)
+	if err != nil {
+		p.metrics.GitHubAPIErrors.WithLabelValues(c.scope()).Inc()
 	}
 }
 
@@ -221,7 +240,7 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 	default:
 		repos, err := ListInstallationRepos(ctx, c.Client)
 		if err != nil {
-			b.observe(time.Now(), err, nil)
+			p.observe(c, b, err, nil)
 			return fmt.Errorf("list repos: %w", err)
 		}
 		for _, r := range repos {
@@ -239,7 +258,7 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 		for _, status := range []string{"queued", "in_progress"} {
 			runs, resp, err := c.Client.Actions.ListRepositoryWorkflowRuns(ctx, ref.owner, ref.name,
 				&github.ListWorkflowRunsOptions{Status: status})
-			b.observe(time.Now(), err, resp)
+			p.observe(c, b, err, resp)
 			// Stop the org's tick the moment the breaker trips — whether from
 			// this error (every remaining repo would fail the same way) or a
 			// low-water/secondary pause set on a successful observe — so we
@@ -297,7 +316,7 @@ func (p *Poller) emitRunJobs(ctx context.Context, out chan<- domain.Job, c orgCl
 	// This per-run call is the dominant rate-limit cost on a busy repo, so feed
 	// its outcome to the breaker too — otherwise an abuse/rate trip here would
 	// never pause the org.
-	b.observe(time.Now(), err, resp)
+	p.observe(c, b, err, resp)
 	if err != nil {
 		slog.Warn("list jobs failed", "repo", owner+"/"+repo, "run", run.GetID(), "err", err)
 		return false
