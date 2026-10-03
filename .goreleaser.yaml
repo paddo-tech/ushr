@@ -44,5 +44,20 @@ archives:
 checksum:
   name_template: checksums.txt
 
+sboms:
+  - artifacts: archive
+
+# Keyless: the release workflow's GitHub OIDC identity is the signer. Signing
+# checksums.txt covers every artifact listed in it.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+
 changelog:
   disable: true

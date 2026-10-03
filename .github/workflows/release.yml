@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  # Keyless cosign signing exchanges the job's OIDC token for a certificate.
+  id-token: write
 
 jobs:
   release:
@@ -19,6 +21,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action/download-syft@v0
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
