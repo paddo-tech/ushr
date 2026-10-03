@@ -105,9 +105,11 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 	fi
 	if [ "$verify_mode" = cosign ]; then
 		bundle_id=$(find_asset "checksums.txt.sigstore.json")
+		# Releases before signing shipped have no bundle; both modes trust the
+		# same GitHub TLS root for checksums.txt, so sha256 loses nothing they had.
 		if [ -z "$bundle_id" ]; then
-			echo "!! Release $tag has no signature bundle (checksums.txt.sigstore.json)." >&2
-			exit 1
+			echo "!! Release $tag has no signature bundle; falling back to sha256 only." >&2
+			verify_mode=sha256
 		fi
 	fi
 	echo "==> Downloading ushr $tag ($os/$arch)"
@@ -141,9 +143,10 @@ else
 			exit 1
 		}
 		if [ "$verify_mode" = cosign ]; then
+			# Releases before signing shipped have no bundle (see the API path).
 			curl -fsSL -o "$tmp/checksums.txt.sigstore.json" "$DL_BASE/checksums.sigstore" || {
-				echo "!! Could not download the release signature bundle." >&2
-				exit 1
+				echo "!! Latest release has no signature bundle; falling back to sha256 only." >&2
+				verify_mode=sha256
 			}
 		fi
 		rc=0

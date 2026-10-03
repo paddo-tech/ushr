@@ -266,6 +266,28 @@ func LoadAgent(path string) (*Agent, error) {
 			}
 		}
 	}
+	// Jobs, JIT clients and priorities are keyed by scope name alone, so one
+	// name on two GitHub instances would collide. Repeats on one instance stay
+	// legal: setup appends a new entry when it replaces a scope's App.
+	bases := map[string]string{}
+	check := func(scope, base string) error {
+		k := strings.ToLower(scope)
+		if prev, ok := bases[k]; ok && !strings.EqualFold(strings.TrimRight(prev, "/"), strings.TrimRight(base, "/")) {
+			return fmt.Errorf("agent.yaml configures %q on two GitHub instances; one agent serves each org or repo name on one instance only", scope)
+		}
+		bases[k] = base
+		return nil
+	}
+	for _, o := range a.Orgs {
+		if err := check(o.Name, o.BaseURL); err != nil {
+			return nil, err
+		}
+	}
+	for _, r := range a.Repos {
+		if err := check(r.Scope(), r.BaseURL); err != nil {
+			return nil, err
+		}
+	}
 	for _, o := range a.Orgs {
 		if err := CheckBaseURL(o.BaseURL); err != nil {
 			return nil, fmt.Errorf("org %s: %w", o.Name, err)

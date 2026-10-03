@@ -72,7 +72,11 @@ func runSetup(ctx context.Context, args []string) error {
 	// Every run of the manifest flow registers a real GitHub App; re-running
 	// setup for an already-configured scope should not silently mint another.
 	if cfg, err := config.LoadAgent(*configPath); err == nil {
-		if id, _, _, ok := configuredTarget(cfg, scope); ok && id != 0 {
+		id, _, base, ok := configuredTarget(cfg, scope)
+		if ok && !strings.EqualFold(strings.TrimRight(base, "/"), strings.TrimRight(*baseURL, "/")) {
+			return fmt.Errorf("%s is already configured for %s; one agent serves each org or repo name on one GitHub instance only", scope, gh.WebURL(base))
+		}
+		if ok && id != 0 {
 			fmt.Printf("==> %s is already configured (App id %d).\n", scope, id)
 			// -y keeps the existing App: assume-yes reruns are provisioning
 			// scripts, and auto-answering yes here would mint a duplicate

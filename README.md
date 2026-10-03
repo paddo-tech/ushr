@@ -47,6 +47,7 @@ On Linux the per-repo docker build cache is on by default.
 
 If cosign is on `PATH`, the installer also verifies the release signature.
 Otherwise it verifies the sha256 checksums only. It prints which mode ran.
+A release with no signature bundle gets the sha256 check only, and the installer warns.
 
 Check a host any time:
 
@@ -56,9 +57,12 @@ ushr doctor
 
 ## macOS drivers: Tart and Lume
 
-Tart is the default macOS driver. Tart's maintainers left with Cirrus Labs,
-and Tart is to be relicensed more permissively. ushr also ships a Lume driver
-as a fallback. Set `driver.type: lume` in `agent.yaml` to use it.
+Tart is the default macOS driver. Cirrus Labs, the Tart maintainers, announced on
+7 Apr 2026 that they would join OpenAI ([announcement](https://cirruslabs.org/)).
+The Tart repository is now [openai/tart](https://github.com/openai/tart).
+Since 5 Jun 2026, Tart uses the
+[FSL-1.1-ALv2 license](https://github.com/openai/tart/blob/main/LICENSE).
+ushr also ships a Lume driver as a fallback. Set `driver.type: lume` in `agent.yaml` to use it.
 
 ## GitHub Enterprise Server
 
@@ -82,6 +86,7 @@ orgs:
 The value is the instance root, with no path. ushr derives the API root (`/api/v3`) from it.
 The agent uses it for App authentication, JIT runner registration and the scaleset source.
 Targets with no `base_url` stay on github.com, so one agent can serve both.
+One agent cannot serve the same org or repo name on two instances. ushr keys jobs by name only.
 `ushr doctor` checks that each configured instance is reachable.
 
 The Tart and Lume drivers still download the runner from github.com/actions/runner releases.

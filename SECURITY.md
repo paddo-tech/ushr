@@ -2,7 +2,9 @@
 
 ## Report a vulnerability
 
-Email **security@ushr.io**. Do not open a public issue or pull request.
+Report it privately through GitHub:
+[open a security advisory](https://github.com/paddo-tech/ushr/security/advisories/new).
+Do not open a public issue or pull request.
 
 Include the affected version, the steps to reproduce, and the impact you expect.
 We tell you when a fix ships.

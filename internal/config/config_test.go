@@ -169,3 +169,18 @@ func TestLoadAgent_RejectsBadBaseURL(t *testing.T) {
 		t.Fatal("LoadAgent accepted a base_url without a scheme")
 	}
 }
+
+func TestLoadAgent_ScopeOnTwoInstances(t *testing.T) {
+	body := strings.Replace(validAgentYAML, "source:", `  - name: Paddo-Tech
+    app_id: 7
+    private_key_path: /tmp/ghe.pem
+    base_url: https://ghe.example.com
+source:`, 1)
+	if _, err := LoadAgent(writeTemp(t, "a.yaml", body)); err == nil {
+		t.Fatal("LoadAgent accepted one org name on two GitHub instances")
+	}
+	same := strings.Replace(body, "    base_url: https://ghe.example.com\n", "", 1)
+	if _, err := LoadAgent(writeTemp(t, "b.yaml", same)); err != nil {
+		t.Fatalf("LoadAgent rejected a repeated org on one instance: %v", err)
+	}
+}
