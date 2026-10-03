@@ -137,6 +137,7 @@ func backfillLedger(ctx context.Context, cfg *config.Controller, since time.Time
 			PrivateKeyPath: o.PrivateKeyPath,
 			Org:            o.Name,
 			Repos:          o.Repos,
+			BaseURL:        o.BaseURL,
 		})
 		if err != nil {
 			return fmt.Errorf("auth %s: %w", o.Name, err)

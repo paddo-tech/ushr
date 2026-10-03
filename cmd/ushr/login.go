@@ -169,7 +169,7 @@ func runLogin(ctx context.Context, args []string) error {
 func missingKeyScopes(cfg *config.Agent, enrolled []string) []string {
 	var out []string
 	for _, e := range enrolled {
-		if _, _, ok := configuredTarget(cfg, e); !ok {
+		if _, _, _, ok := configuredTarget(cfg, e); !ok {
 			out = append(out, e)
 		}
 	}

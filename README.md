@@ -60,6 +60,34 @@ Tart is the default macOS driver. Tart's maintainers left with Cirrus Labs,
 and Tart is to be relicensed more permissively. ushr also ships a Lume driver
 as a fallback. Set `driver.type: lume` in `agent.yaml` to use it.
 
+## GitHub Enterprise Server
+
+ushr uses github.com by default.
+To serve an org or repo on a GitHub Enterprise Server instance, give its root URL to `ushr setup`:
+
+```bash
+ushr setup --org YOUR_ORG --base-url https://ghe.example.com
+```
+
+Setup creates the GitHub App on that instance and writes `base_url` into the target in `agent.yaml`:
+
+```yaml
+orgs:
+  - name: YOUR_ORG
+    app_id: 12
+    private_key_path: ~/.secrets/ushr-abc123-YOUR_ORG.pem
+    base_url: https://ghe.example.com
+```
+
+The value is the instance root, with no path. ushr derives the API root (`/api/v3`) from it.
+The agent uses it for App authentication, JIT runner registration and the scaleset source.
+Targets with no `base_url` stay on github.com, so one agent can serve both.
+`ushr doctor` checks that each configured instance is reachable.
+
+The Tart and Lume drivers still download the runner from github.com/actions/runner releases.
+GHES does not host these releases, so the host needs outbound access to github.com.
+`ushr login` with the hosted plane supports github.com only.
+
 ## Managed agent updates
 
 Workspace admins can select **Update agent** on a host in the Fleet dashboard.

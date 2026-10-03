@@ -149,3 +149,23 @@ func TestLoadController_MissingVersion(t *testing.T) {
 		t.Fatal("expected error for missing version")
 	}
 }
+
+func TestCheckBaseURL(t *testing.T) {
+	for _, ok := range []string{"", "https://ghe.example.com", "https://ghe.example.com/", "http://10.0.0.5:8080"} {
+		if err := CheckBaseURL(ok); err != nil {
+			t.Errorf("CheckBaseURL(%q): %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"ghe.example.com", "https://ghe.example.com/api/v3", "ftp://ghe.example.com", "https://github.com"} {
+		if err := CheckBaseURL(bad); err == nil {
+			t.Errorf("CheckBaseURL(%q) accepted", bad)
+		}
+	}
+}
+
+func TestLoadAgent_RejectsBadBaseURL(t *testing.T) {
+	body := strings.Replace(validAgentYAML, "    priority: 100", "    priority: 100\n    base_url: ghe.example.com", 1)
+	if _, err := LoadAgent(writeTemp(t, "a.yaml", body)); err == nil {
+		t.Fatal("LoadAgent accepted a base_url without a scheme")
+	}
+}

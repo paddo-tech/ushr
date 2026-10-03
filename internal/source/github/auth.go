@@ -26,6 +26,8 @@ type AppAuth struct {
 	// Repos optionally restricts an org target's polling to these repo names;
 	// empty polls all installation repos. Unused for repo targets.
 	Repos []string
+	// BaseURL names a GHES instance; empty means github.com.
+	BaseURL string
 }
 
 // Scope returns the tenant scope this auth mints under: the org login, or
@@ -53,7 +55,11 @@ func InstallationID(ctx context.Context, appID int64, key []byte, a AppAuth) (in
 	if err != nil {
 		return 0, fmt.Errorf("load app key: %w", err)
 	}
-	jwtClient := github.NewClient(&http.Client{Transport: jwtTransport})
+	jwtTransport.BaseURL = APIURL(a.BaseURL)
+	jwtClient, err := NewClient(&http.Client{Transport: jwtTransport}, a.BaseURL)
+	if err != nil {
+		return 0, err
+	}
 	if a.Repo != "" {
 		install, _, err := jwtClient.Apps.FindRepositoryInstallation(ctx, a.Owner, a.Repo)
 		if err != nil {
@@ -88,5 +94,6 @@ func NewAppClient(ctx context.Context, a AppAuth) (*github.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("installation transport: %w", err)
 	}
-	return github.NewClient(&http.Client{Transport: tr}), nil
+	tr.BaseURL = APIURL(a.BaseURL)
+	return NewClient(&http.Client{Transport: tr}, a.BaseURL)
 }

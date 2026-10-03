@@ -17,8 +17,10 @@ import (
 // appInstalled reports whether the App has an installation covering scope.
 // A false with a nil-or-404 distinction matters to callers: 404 means "not
 // installed", anything else means "couldn't verify".
-func appInstalled(ctx context.Context, appID int64, key []byte, scope string) (bool, error) {
-	if _, err := gh.InstallationID(ctx, appID, key, gh.ParseScope(scope)); err != nil {
+func appInstalled(ctx context.Context, appID int64, key []byte, scope, baseURL string) (bool, error) {
+	a := gh.ParseScope(scope)
+	a.BaseURL = baseURL
+	if _, err := gh.InstallationID(ctx, appID, key, a); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -38,21 +40,21 @@ func isNotInstalled(err error) bool {
 
 // The agent must not start for a scope its App cannot serve.
 func checkInstalled(ctx context.Context, cfg *config.Agent, scope string) error {
-	appID, keyPath, _ := configuredTarget(cfg, scope)
+	appID, keyPath, baseURL, _ := configuredTarget(cfg, scope)
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if _, err := appInstalled(ctx, appID, key, scope); err != nil {
+	if _, err := appInstalled(ctx, appID, key, scope, baseURL); err != nil {
 		return fmt.Errorf("GitHub app is not ready for %s: %w", scope, err)
 	}
 	return nil
 }
 
 // An uninstalled app must not advance setup to agent startup.
-func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, installURL string) error {
+func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, baseURL, installURL string) error {
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return err
@@ -64,7 +66,7 @@ func waitForAppInstall(ctx context.Context, appID int64, keyPath, scope, install
 	defer tick.Stop()
 	for {
 		checkCtx, checkCancel := context.WithTimeout(waitCtx, 10*time.Second)
-		ok, err := appInstalled(checkCtx, appID, key, scope)
+		ok, err := appInstalled(checkCtx, appID, key, scope, baseURL)
 		checkCancel()
 		if ok {
 			fmt.Println("==> GitHub app installed on", scope)

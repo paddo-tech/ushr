@@ -14,6 +14,7 @@ import (
 	"github.com/paddo-tech/ushr/internal/disk"
 	"github.com/paddo-tech/ushr/internal/driver"
 	"github.com/paddo-tech/ushr/internal/driver/factory"
+	gh "github.com/paddo-tech/ushr/internal/source/github"
 	"github.com/paddo-tech/ushr/internal/svc"
 )
 
@@ -109,7 +110,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	// App that is actually installed on the scope — key-on-disk alone still
 	// can't mint runner configs. A transport error is reported as unverified,
 	// not failed: offline doctor must not flag a correct setup.
-	checkTarget := func(appID int64, keyPath, scope, setupHint string) {
+	checkTarget := func(appID int64, keyPath, scope, baseURL, setupHint string) {
 		if appID == 0 {
 			check(false, fmt.Sprintf("GitHub App key for %s", scope), setupHint)
 			return
@@ -120,7 +121,7 @@ func runDoctor(ctx context.Context, args []string) error {
 			return
 		}
 		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		installed, ierr := appInstalled(checkCtx, appID, key, scope)
+		installed, ierr := appInstalled(checkCtx, appID, key, scope, baseURL)
 		cancel()
 		switch {
 		case installed:
@@ -128,7 +129,7 @@ func runDoctor(ctx context.Context, args []string) error {
 		case isNotInstalled(ierr):
 			// 404 for a repo target also fires on a mistyped owner/repo.
 			check(false, fmt.Sprintf("GitHub App installed on %s", scope),
-				fmt.Sprintf("install App id %d on %s (github.com → Settings → Developer settings → GitHub Apps) — or fix the scope if it's mistyped", appID, scope))
+				fmt.Sprintf("install App id %d on %s (%s → Settings → Developer settings → GitHub Apps) — or fix the scope if it's mistyped", appID, scope, gh.WebURL(baseURL)))
 		default:
 			// Not proven either way: could be network, a bad/corrupt key, or
 			// revoked credentials — don't fail a possibly-correct setup, but
@@ -136,11 +137,24 @@ func runDoctor(ctx context.Context, args []string) error {
 			fmt.Printf("  ? GitHub App install on %s could not be verified: %v\n", scope, ierr)
 		}
 	}
+	// A GHES instance that is down or blocked fails every target on it, so name
+	// the instance once before the per-target checks.
+	checked := map[string]bool{}
+	checkBase := func(baseURL string) {
+		if baseURL == "" || checked[baseURL] {
+			return
+		}
+		checked[baseURL] = true
+		check(reachable(ctx, gh.APIURL(baseURL)), fmt.Sprintf("GitHub Enterprise Server reachable (%s)", baseURL),
+			"check base_url in agent.yaml, network and TLS trust for the instance")
+	}
 	for _, o := range cfg.Orgs {
-		checkTarget(o.AppID, o.PrivateKeyPath, o.Name, fmt.Sprintf("ushr setup --org %s", o.Name))
+		checkBase(o.BaseURL)
+		checkTarget(o.AppID, o.PrivateKeyPath, o.Name, o.BaseURL, setupCmd("--org "+o.Name, o.BaseURL))
 	}
 	for _, r := range cfg.Repos {
-		checkTarget(r.AppID, r.PrivateKeyPath, r.Scope(), fmt.Sprintf("ushr setup --repo %s", r.Scope()))
+		checkBase(r.BaseURL)
+		checkTarget(r.AppID, r.PrivateKeyPath, r.Scope(), r.BaseURL, setupCmd("--repo "+r.Scope(), r.BaseURL))
 	}
 	if len(cfg.Orgs) == 0 && len(cfg.Repos) == 0 {
 		check(false, "orgs/repos configured", "run `ushr login` (hosted) or `ushr setup --org NAME` (local)")
@@ -156,16 +170,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	// Reachability of whatever controller the agent actually talks to
 	// (credentials.yaml overrides agent.yaml).
 	if cfg.ControllerURL != "" {
-		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		ok := false
-		if req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.ControllerURL+"/healthz", nil); err == nil {
-			if resp, err := http.DefaultClient.Do(req); err == nil {
-				ok = resp.StatusCode < 500
-				_ = resp.Body.Close()
-			}
-		}
-		check(ok, fmt.Sprintf("control plane reachable (%s)", cfg.ControllerURL),
+		check(reachable(ctx, cfg.ControllerURL+"/healthz"), fmt.Sprintf("control plane reachable (%s)", cfg.ControllerURL),
 			"check the URL, network, and (local OSS) that ushr-controller is running")
 	}
 
@@ -174,4 +179,27 @@ func runDoctor(ctx context.Context, args []string) error {
 	}
 	fmt.Println("\nAll checks passed.")
 	return nil
+}
+
+// reachable reports whether url answers below 500 within 10s.
+func reachable(ctx context.Context, url string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode < 500
+}
+
+func setupCmd(target, baseURL string) string {
+	if baseURL == "" {
+		return "ushr setup " + target
+	}
+	return "ushr setup " + target + " --base-url " + baseURL
 }

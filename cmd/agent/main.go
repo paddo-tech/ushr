@@ -127,7 +127,7 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 	minter := jit.New()
 	prio := make(map[string]int, len(cfg.Orgs)+len(cfg.Repos))
 	for _, o := range cfg.Orgs {
-		auth := gh.AppAuth{AppID: o.AppID, PrivateKeyPath: o.PrivateKeyPath, Org: o.Name, Repos: o.Repos}
+		auth := gh.AppAuth{AppID: o.AppID, PrivateKeyPath: o.PrivateKeyPath, Org: o.Name, Repos: o.Repos, BaseURL: o.BaseURL}
 		auths = append(auths, auth)
 		prio[o.Name] = o.Priority
 		if err := minter.Add(ctx, auth, o.RunnerGroupID); err != nil {
@@ -137,7 +137,7 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 	// Repo targets (personal-account / per-repo). No runner group — repo runners
 	// always join the default group (handled in jit.mintRepo).
 	for _, r := range cfg.Repos {
-		auth := gh.AppAuth{AppID: r.AppID, PrivateKeyPath: r.PrivateKeyPath, Owner: r.Owner, Repo: r.Repo}
+		auth := gh.AppAuth{AppID: r.AppID, PrivateKeyPath: r.PrivateKeyPath, Owner: r.Owner, Repo: r.Repo, BaseURL: r.BaseURL}
 		auths = append(auths, auth)
 		prio[r.Scope()] = r.Priority
 		if err := minter.Add(ctx, auth, 0); err != nil {

@@ -143,7 +143,7 @@ func hostedAppSetup(ctx context.Context, scope, keyDir, configPath, web, token s
 			case <-tick.C:
 			}
 		}
-		app, err := exchangeCode(ctx, result.Code)
+		app, err := exchangeCode(ctx, "", result.Code)
 		if err != nil {
 			// The one-time code may be spent even when the response is lost, so the next login starts over.
 			state = hostedSetupState{}
@@ -173,7 +173,7 @@ func hostedAppSetup(ctx context.Context, scope, keyDir, configPath, web, token s
 	installURL := "https://github.com/apps/" + state.Slug + "/installations/new"
 	fmt.Println("==> Install your runner app on GitHub:")
 	fmt.Println("    " + installURL)
-	if err := waitForAppInstall(ctx, state.AppID, keyPath, scope, installURL); err != nil {
+	if err := waitForAppInstall(ctx, state.AppID, keyPath, scope, "", installURL); err != nil {
 		return err
 	}
 	owner, repo, isRepo := domain.SplitRepoScope(scope)

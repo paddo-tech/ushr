@@ -24,6 +24,7 @@ import (
 
 	"github.com/paddo-tech/ushr/internal/config"
 	"github.com/paddo-tech/ushr/internal/domain"
+	gh "github.com/paddo-tech/ushr/internal/source/github"
 	"github.com/paddo-tech/ushr/internal/svc"
 )
 
@@ -43,6 +44,7 @@ func runSetup(ctx context.Context, args []string) error {
 	org := fs.String("org", "", "GitHub organization to create the App in (org-level runners)")
 	repo := fs.String("repo", "", "GitHub owner/repo to create the App for (repo-level runners, e.g. personal accounts)")
 	priority := fs.Int("priority", 100, priorityHelp)
+	baseURL := fs.String("base-url", "", "GitHub Enterprise Server root, e.g. https://ghe.example.com (default github.com)")
 	keyDir := fs.String("key-dir", filepath.Join(os.Getenv("HOME"), ".secrets"), "directory to write the App private key")
 	configPath := fs.String("config", filepath.Join(os.Getenv("HOME"), ".config", "ushr", "agent.yaml"), "agent config to record the App in")
 	yes := fs.Bool("y", false, "answer yes to prompts")
@@ -51,6 +53,9 @@ func runSetup(ctx context.Context, args []string) error {
 	}
 	if (*org == "") == (*repo == "") {
 		return errors.New("exactly one of --org or --repo is required")
+	}
+	if err := config.CheckBaseURL(*baseURL); err != nil {
+		return err
 	}
 	scope := *org
 	if scope == "" {
@@ -67,7 +72,7 @@ func runSetup(ctx context.Context, args []string) error {
 	// Every run of the manifest flow registers a real GitHub App; re-running
 	// setup for an already-configured scope should not silently mint another.
 	if cfg, err := config.LoadAgent(*configPath); err == nil {
-		if id, _, ok := configuredTarget(cfg, scope); ok && id != 0 {
+		if id, _, _, ok := configuredTarget(cfg, scope); ok && id != 0 {
 			fmt.Printf("==> %s is already configured (App id %d).\n", scope, id)
 			// -y keeps the existing App: assume-yes reruns are provisioning
 			// scripts, and auto-answering yes here would mint a duplicate
@@ -81,7 +86,7 @@ func runSetup(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	if err := appSetup(ctx, scope, *keyDir, *configPath, *priority); err != nil {
+	if err := appSetup(ctx, scope, *baseURL, *keyDir, *configPath, *priority); err != nil {
 		return err
 	}
 	return offerServices(*configPath, *yes)
@@ -120,9 +125,9 @@ func offerServices(configPath string, assumeYes bool) error {
 }
 
 // appSetup runs the GitHub App manifest flow for scope (an org name or an
-// "owner/repo"), writes the private key, opens the App install page, and
+// "owner/repo") on the GitHub instance at baseURL, writes the private key, opens the App install page, and
 // records the target in the agent config — no hand-editing.
-func appSetup(ctx context.Context, scope, keyDir, configPath string, priority int) error {
+func appSetup(ctx context.Context, scope, baseURL, keyDir, configPath string, priority int) error {
 	// The manifest form-POST target, the App permissions, and the key filename
 	// all differ between an org App (org-level runner pool) and a repo App
 	// (repo-level runners — the only option for personal accounts).
@@ -133,7 +138,7 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 	var actionURL string
 	var perms map[string]string
 	if !isRepo {
-		actionURL = fmt.Sprintf("https://github.com/organizations/%s/settings/apps/new", scope)
+		actionURL = fmt.Sprintf("%s/organizations/%s/settings/apps/new", gh.WebURL(baseURL), scope)
 		perms = map[string]string{
 			"actions":                          "read",
 			"metadata":                         "read",
@@ -143,7 +148,7 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 		// Created under the signed-in user, not an org. Repo-level runner
 		// management rides on the repo "Administration" permission — there is no
 		// dedicated repo self-hosted-runners scope.
-		actionURL = "https://github.com/settings/apps/new"
+		actionURL = gh.WebURL(baseURL) + "/settings/apps/new"
 		perms = map[string]string{
 			"actions":        "read",
 			"metadata":       "read",
@@ -192,7 +197,7 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 		return err
 	}
 
-	cfg, err := exchangeCode(ctx, cb.code)
+	cfg, err := exchangeCode(ctx, baseURL, cb.code)
 	if err != nil {
 		return fmt.Errorf("exchange code: %w", err)
 	}
@@ -209,7 +214,7 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 	}
 	fmt.Printf("==> Wrote private key %s (mode 0600)\n", keyPath)
 
-	installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new", cfg.GetSlug())
+	installURL := gh.AppInstallURL(baseURL, cfg.GetSlug())
 	fmt.Println()
 	fmt.Printf("==> Install the App on %s (pick the repos your runners serve):\n", scope)
 	fmt.Println("    " + installURL)
@@ -218,11 +223,11 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 
 	if !isRepo {
 		err = config.AddOrg(configPath, config.Org{
-			Name: scope, AppID: cfg.GetID(), PrivateKeyPath: keyPath, Priority: priority,
+			Name: scope, AppID: cfg.GetID(), PrivateKeyPath: keyPath, Priority: priority, BaseURL: baseURL,
 		})
 	} else {
 		err = config.AddRepo(configPath, config.RepoTarget{
-			Owner: owner, Repo: repoName, AppID: cfg.GetID(), PrivateKeyPath: keyPath, Priority: priority,
+			Owner: owner, Repo: repoName, AppID: cfg.GetID(), PrivateKeyPath: keyPath, Priority: priority, BaseURL: baseURL,
 		})
 	}
 	if err != nil {
@@ -230,23 +235,23 @@ func appSetup(ctx context.Context, scope, keyDir, configPath string, priority in
 	}
 	fmt.Printf("==> Recorded %s (app id %d) in %s\n", scope, cfg.GetID(), configPath)
 
-	return waitForAppInstall(ctx, cfg.GetID(), keyPath, scope, installURL)
+	return waitForAppInstall(ctx, cfg.GetID(), keyPath, scope, baseURL, installURL)
 }
 
 // configuredTarget reports whether scope is recorded in the agent config, and
-// with which App id (0 = placeholder entry awaiting an App).
-func configuredTarget(cfg *config.Agent, scope string) (int64, string, bool) {
+// with which App id (0 = placeholder entry awaiting an App), key and base URL.
+func configuredTarget(cfg *config.Agent, scope string) (int64, string, string, bool) {
 	for _, o := range cfg.Orgs {
 		if strings.EqualFold(o.Name, scope) {
-			return o.AppID, o.PrivateKeyPath, true
+			return o.AppID, o.PrivateKeyPath, o.BaseURL, true
 		}
 	}
 	for _, r := range cfg.Repos {
 		if strings.EqualFold(r.Scope(), scope) {
-			return r.AppID, r.PrivateKeyPath, true
+			return r.AppID, r.PrivateKeyPath, r.BaseURL, true
 		}
 	}
-	return 0, "", false
+	return 0, "", "", false
 }
 
 type callback struct {
@@ -348,8 +353,11 @@ func waitForCallback(ctx context.Context, listener net.Listener, actionURL, mani
 	}
 }
 
-func exchangeCode(ctx context.Context, code string) (*github.AppConfig, error) {
-	c := github.NewClient(nil)
+func exchangeCode(ctx context.Context, baseURL, code string) (*github.AppConfig, error) {
+	c, err := gh.NewClient(nil, baseURL)
+	if err != nil {
+		return nil, err
+	}
 	cfg, _, err := c.Apps.CompleteAppManifest(ctx, code)
 	return cfg, err
 }
