@@ -65,6 +65,31 @@ Each update starts a new supervisor and worker under that recovery process.
 A new dashboard request can retry a failed release. Older targets cannot downgrade an agent.
 Managed updates replace the agent binary. Use the installer to update the CLI and a local controller.
 
+## Priority policy
+
+The control plane now owns each scope's priority. A scope is a GitHub org login or `owner/repo`.
+Before this change, each agent sent the `priority` from its own `agent.yaml`.
+That value still applies when no policy exists for the scope.
+A policy value replaces the agent value for every agent that reports the scope.
+Aging still adds `boost_per_minute` for each minute a job waits.
+
+Self-hosted controllers read the policy from `controller.yaml`:
+
+```yaml
+policy:
+  type: priority
+  aging:
+    boost_per_minute: 1
+  priorities:
+    example-org: 100
+    example-owner/example-repo: 20
+```
+
+The hosted control plane reads the `priority_policies` table.
+Workspace admins set it in the Workspace settings page.
+A row applies only while its workspace owns the scope.
+If the table read fails, the control plane uses the agent values for that poll.
+
 ## Job telemetry
 
 The dashboard combines runner dispatch records with signed GitHub `workflow_job` events.

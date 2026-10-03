@@ -111,6 +111,10 @@ type ScaleSet struct {
 type Policy struct {
 	Type  PolicyType `yaml:"type"`
 	Aging Aging      `yaml:"aging"`
+	// Priorities sets the priority per scope (an org login or "owner/repo").
+	// A listed scope overrides the priority its agents report; an unlisted
+	// scope keeps the agent-reported value.
+	Priorities map[string]int `yaml:"priorities"`
 }
 
 type Aging struct {

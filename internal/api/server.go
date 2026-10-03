@@ -56,6 +56,7 @@ type Server struct {
 	ledger         dispatch.Store
 	enroll         enroll.Store       // nil = OSS single-host (static token / loopback only)
 	telemetry      telemetry.Recorder // Noop unless WithTelemetry is called
+	priorities     PriorityPolicy     // nil unless WithPriorities is called
 	// Session create is unauthenticated; without a rate cap a flood keeps
 	// ~rate×TTL live rows in the store (the prune only clears expired ones).
 	sessionLimiter *ipLimiter
@@ -387,6 +388,7 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		s.hold(w, r)
 		return
 	}
+	s.applyPriorities(r.Context(), req.Queues)
 
 	// Try the best runnable job; if another agent raced us to it (ErrDuplicate),
 	// mark it live and try the next best rather than holding for a full poll
@@ -433,7 +435,7 @@ func writeOffer(w http.ResponseWriter, best dispatch.Record) {
 
 // pick chooses the highest-priority reported job this agent can run that isn't
 // in the live set (already offered/claimed, or raced this poll). Score is the
-// org's advisory priority plus aging from wait time; ties break toward the
+// org's priority (policy value, else agent-reported) plus aging from wait time; ties break toward the
 // longer-waiting job. orgs is the token's tenant set (empty for the unscoped
 // static token), used to namespace the record's liveness identity.
 func (s *Server) pick(name string, orgs []string, req PollRequest, live map[string]bool) (dispatch.Record, bool) {

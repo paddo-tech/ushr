@@ -70,6 +70,12 @@ func run(configPath string) error {
 
 	srv := api.NewServer(cfg.Policy.Aging.BoostPerMinute, cfg.Token, store, enr)
 	srv.WithTelemetry(rec)
+	// Hosted reads the workspace policy table; OSS reads controller config.
+	if pol, ok := enr.(api.PriorityPolicy); ok {
+		srv.WithPriorities(pol)
+	} else if len(cfg.Policy.Priorities) > 0 {
+		srv.WithPriorities(api.NewStaticPriorities(cfg.Policy.Priorities))
+	}
 	if err := srv.RequireScopedAuth(); err != nil {
 		return err
 	}

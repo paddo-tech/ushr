@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,7 +18,18 @@ const opTimeout = 5 * time.Second
 // Append-only: never edit an entry that has shaped the live database. All
 // entries share ONE transaction, so statements that can't run in a tx block
 // (CREATE INDEX CONCURRENTLY, VACUUM) are off-limits here.
-var migrations = []string{schemaV1, schemaV2}
+var migrations = []string{schemaV1, schemaV2, schemaV3}
+
+// schemaV3 holds each workspace's central priority per scope. The web app
+// writes it; scope is an org login or "owner/repo" in org_installations casing.
+const schemaV3 = `
+CREATE TABLE priority_policies (
+ account_org_id text NOT NULL,
+ scope text NOT NULL,
+ priority int NOT NULL,
+ updated_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY (account_org_id, scope)
+);`
 
 const schemaV2 = `
 CREATE TABLE runner_apps (
@@ -112,6 +124,33 @@ func (p *PG) Webhook(ctx context.Context, id string) (secret, scope, name string
 		err = nil
 	}
 	return
+}
+
+// Priorities returns the policy priority for each scope that has one, keyed by
+// the lower-cased scope. A row counts only while its workspace still owns the
+// scope in org_installations, so one workspace cannot set another's priority.
+func (p *PG) Priorities(ctx context.Context, scopes []string) (map[string]int, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	lower := make([]string, len(scopes))
+	for i, s := range scopes {
+		lower[i] = strings.ToLower(s)
+	}
+	rows, err := p.pool.Query(ctx, `
+ SELECT lower(p.scope), p.priority FROM priority_policies p
+ JOIN org_installations o ON o.account_org_id = p.account_org_id AND lower(o.github_org) = lower(p.scope)
+ WHERE lower(p.scope) = ANY($1)`, lower)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int)
+	var scope string
+	var prio int
+	_, err = pgx.ForEachRow(rows, []any{&scope, &prio}, func() error {
+		out[scope] = prio
+		return nil
+	})
+	return out, err
 }
 
 var _ Store = (*PG)(nil)

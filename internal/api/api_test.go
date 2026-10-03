@@ -447,6 +447,68 @@ func TestPickPriorityOrder(t *testing.T) {
 	}
 }
 
+type failingPolicy struct{}
+
+func (failingPolicy) Priorities(context.Context, []string) (map[string]int, error) {
+	return nil, errors.New("db down")
+}
+
+func TestPriorityPolicyOverridesAgent(t *testing.T) {
+	queues := func() []OrgQueue {
+		return []OrgQueue{
+			{Org: "Agent-High", Priority: 50, Jobs: []QueuedJob{{JobID: 1, Labels: []string{"self-hosted"}}}},
+			{Org: "acme/web", Priority: 0, Jobs: []QueuedJob{{JobID: 2, Labels: []string{"self-hosted"}}}},
+			{Org: "unlisted", Priority: 7, Jobs: []QueuedJob{{JobID: 3, Labels: []string{"self-hosted"}}}},
+		}
+	}
+	cases := []struct {
+		name   string
+		policy PriorityPolicy
+		want   []int
+	}{
+		{"no policy keeps agent values", nil, []int{50, 0, 7}},
+		{"policy overrides listed scopes, case-insensitive", NewStaticPriorities(map[string]int{"agent-high": 1, "ACME/web": 100}), []int{1, 100, 7}},
+		{"lookup failure keeps agent values", failingPolicy{}, []int{50, 0, 7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(0, "", memLedger(t), nil)
+			if tc.policy != nil {
+				s.WithPriorities(tc.policy)
+			}
+			qs := queues()
+			s.applyPriorities(context.Background(), qs)
+			for i, q := range qs {
+				if q.Priority != tc.want[i] {
+					t.Errorf("%s: priority %d, want %d", q.Org, q.Priority, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPollUsesPriorityPolicy(t *testing.T) {
+	s := NewServer(0, "secret", memLedger(t), nil)
+	// The agent ranks "noisy" first; the controller policy ranks "critical" first.
+	s.WithPriorities(NewStaticPriorities(map[string]int{"critical": 10, "noisy": 0}))
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	o, err := NewClient(srv.URL, "secret").Poll(ctx, "a1", PollRequest{Capacity: 1, Labels: []string{"self-hosted"},
+		Queues: []OrgQueue{
+			{Org: "noisy", Priority: 99, Jobs: []QueuedJob{{JobID: 1, Labels: []string{"self-hosted"}, WaitingSecs: 600}}},
+			{Org: "critical", Priority: 0, Jobs: []QueuedJob{{JobID: 2, Labels: []string{"self-hosted"}}}},
+		}})
+	if err != nil || o == nil {
+		t.Fatalf("poll: err=%v offer=%v", err, o)
+	}
+	if o.JobID != 2 {
+		t.Fatalf("want the policy-preferred job 2, got %d", o.JobID)
+	}
+}
+
 func TestSweepExpiresOffer(t *testing.T) {
 	led := memLedger(t)
 	s := NewServer(0, "", led, nil)
