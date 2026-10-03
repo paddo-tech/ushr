@@ -2,7 +2,7 @@
 
 Cross-org priority scheduler for self-hosted GitHub Actions runners. Architecture in [DESIGN.md](DESIGN.md).
 
-**Status:** v0.2.8, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
+**Status:** v0.2.10, Apache-2.0. Multi-host, keyless: the agent holds your GitHub
 App key and the control plane never sees a credential.
 
 Run it two ways. Self-host the controller alongside the agent (`ushr setup`) and
@@ -45,11 +45,20 @@ Both are interactive but zero-edit: prereqs are offered as guided installs
 clicks, and the org block is written into `~/.config/ushr/agent.yaml` for you.
 On Linux the per-repo docker build cache is on by default.
 
+If cosign is on `PATH`, the installer also verifies the release signature.
+Otherwise it verifies the sha256 checksums only. It prints which mode ran.
+
 Check a host any time:
 
 ```bash
 ushr doctor
 ```
+
+## macOS drivers: Tart and Lume
+
+Tart is the default macOS driver. Tart's maintainers left with Cirrus Labs,
+and Tart is to be relicensed more permissively. ushr also ships a Lume driver
+as a fallback. Set `driver.type: lume` in `agent.yaml` to use it.
 
 ## Managed agent updates
 
@@ -73,6 +82,20 @@ Point the webhook at `/webhook` on the control plane and subscribe to **Workflow
 Start events supply live job links. Completion events supply workflow names, results, and execution times.
 The dashboard identifies missing results and estimated slot durations.
 
+## Verify a release
+
+Each release signs `checksums.txt` with keyless cosign through the release
+workflow's GitHub OIDC identity. Each archive also has an SPDX SBOM from syft.
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/paddo-tech/ushr/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum --ignore-missing -c checksums.txt
+```
+
 ## Development
 
 ```bash
@@ -93,7 +116,8 @@ go run ./cmd/integration-test -trigger-repo=example-repo
 Shipped: Tart / Lume / Docker / SSH drivers, polling and scaleset sources,
 priority + aging, multi-host, two-phase keyless dispatch, per-agent enrollment,
 persistent dispatch ledger, `ushr cost`, one-command host setup, disk-pressure
-gating and reclaim.
+gating and reclaim, shared runner pools, managed agent updates, job telemetry,
+GitHub App setup from any browser.
 
 Next: Kubernetes driver, Prometheus metrics, docs site.
 
@@ -102,6 +126,11 @@ Next: Kubernetes driver, Prometheus metrics, docs site.
 - **Controller ↔ Agent:** per-agent enrollment tokens minted by `ushr login`, scoped to the orgs the agent may serve. Self-hosted single-host instead uses a shared bearer token, or no token at all when bound to loopback.
 - **Agent ↔ GitHub:** GitHub App per org via `ghinstallation/v2`. App ID + private key path in `agent.yaml`; installation ID auto-discovered. The control plane never sees a GitHub credential.
 - **JIT runner registration:** the agent mints a fresh JIT config per dispatch via `Actions.GenerateOrgJITConfig`. Runner is single-use and self-removes from GitHub when the job finishes.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -6,11 +6,17 @@
 # Downloads via get.ushr.io by default (no token needed). Set GITHUB_TOKEN to
 # fetch straight from the GitHub API instead. Override the install dir with
 # USHR_PREFIX (default ~/.local/bin).
+#
+# With cosign on PATH, the installer also checks the release's keyless
+# signature on checksums.txt before it trusts any checksum in it.
 set -eu
 
 REPO="paddo-tech/ushr"
 DL_BASE="${USHR_DL_BASE:-https://get.ushr.io/dl}"
 PREFIX="${USHR_PREFIX:-$HOME/.local/bin}"
+# Only the tagged release workflow of this repo may sign releases.
+SIGNER="^https://github\.com/$REPO/\.github/workflows/release\.yml@refs/tags/v"
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$os" in
@@ -33,6 +39,14 @@ esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+if command -v cosign >/dev/null 2>&1; then
+	verify_mode=cosign
+	echo "==> Verify mode: cosign signature + sha256"
+else
+	verify_mode=sha256
+	echo "==> Verify mode: sha256 only (install cosign to also check the release signature)"
+fi
+
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then
 		sha256sum "$1" | cut -d' ' -f1
@@ -41,10 +55,19 @@ sha256() {
 	fi
 }
 
-# Refuse to install unless the goreleaser sha256 matches; authenticity still
-# rests on TLS to GitHub (both files share one trust root).
+# Refuse to install unless the goreleaser sha256 matches. In sha256 mode,
+# authenticity rests on TLS to GitHub (both files share one trust root); in
+# cosign mode, it rests on the release workflow's signature.
 # rc 1 = mismatch (retriable race); rc 2 = no entry for this platform (final).
 verify_tarball() {
+	if [ "$verify_mode" = cosign ] && ! cosign verify-blob \
+		--bundle "$tmp/checksums.txt.sigstore.json" \
+		--certificate-identity-regexp "$SIGNER" \
+		--certificate-oidc-issuer "$OIDC_ISSUER" \
+		"$tmp/checksums.txt"; then
+		echo "!! cosign signature check failed for checksums.txt." >&2
+		return 1
+	fi
 	want=$(grep "_${os}_${arch}\.tar\.gz\$" "$tmp/checksums.txt" | head -1 | cut -d' ' -f1)
 	if [ -z "$want" ]; then
 		echo "!! No checksum entry for ${os}/${arch} in checksums.txt." >&2
@@ -80,6 +103,13 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 		echo "!! Missing $name or checksums.txt in release $tag." >&2
 		exit 1
 	fi
+	if [ "$verify_mode" = cosign ]; then
+		bundle_id=$(find_asset "checksums.txt.sigstore.json")
+		if [ -z "$bundle_id" ]; then
+			echo "!! Release $tag has no signature bundle (checksums.txt.sigstore.json)." >&2
+			exit 1
+		fi
+	fi
 	echo "==> Downloading ushr $tag ($os/$arch)"
 	dl_asset() { # id dest
 		curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -88,15 +118,18 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 	}
 	dl_asset "$asset_id" "$tmp/ushr.tar.gz"
 	dl_asset "$sums_id" "$tmp/checksums.txt"
+	if [ "$verify_mode" = cosign ]; then
+		dl_asset "$bundle_id" "$tmp/checksums.txt.sigstore.json"
+	fi
 	verify_tarball || {
 		echo "!! Refusing to install." >&2
 		exit 1
 	}
 else
 	echo "==> Downloading ushr ($os/$arch)"
-	# The tarball and checksums resolve "latest" independently server-side; a
-	# release published between the two fetches makes them mismatch. One
-	# retry gets a coherent pair.
+	# The tarball, checksums and signature resolve "latest" independently
+	# server-side; a release published between the fetches makes them
+	# mismatch. One retry gets a coherent set.
 	attempt=1
 	while :; do
 		{
@@ -107,6 +140,12 @@ else
 			echo "   source instead: clone $REPO and run deploy/install.sh." >&2
 			exit 1
 		}
+		if [ "$verify_mode" = cosign ]; then
+			curl -fsSL -o "$tmp/checksums.txt.sigstore.json" "$DL_BASE/checksums.sigstore" || {
+				echo "!! Could not download the release signature bundle." >&2
+				exit 1
+			}
+		fi
 		rc=0
 		verify_tarball || rc=$?
 		if [ "$rc" -eq 0 ]; then

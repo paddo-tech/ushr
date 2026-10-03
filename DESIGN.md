@@ -175,11 +175,11 @@ One controller (could be on a small Linux VPS or one of the runner hosts). N age
 
 ## Open questions
 
-- Auth between controller and agent: shared token (v1) vs mTLS (later). Token is fine for self-hosted; mTLS becomes important for SaaS.
-- Agent identity / reconnection semantics: how does the controller know an agent is still alive? Heartbeat? gRPC stream?
+- ~~Auth between controller and agent.~~ Done (v0.2): per-agent enrollment tokens scoped to the agent's orgs; self-hosted single-host keeps a shared token or loopback with no token. mTLS is still open.
+- ~~Agent identity / reconnection semantics.~~ Done (v0.2): the long poll is the heartbeat. The server marks a silent agent's claimed dispatches lost after four missed poll windows.
 - JIT registration token caching — GitHub limits token request rate; need to handle gracefully.
 - **Org auth: PAT fallback alongside GitHub App.** Real users will start with a PAT for testing before setting up an App. Need to either support per-org `token:` field or document the App-only path.
-- **Agent capability advertisement.** Agents currently have no `labels:` in their config — but the controller needs to know which agents can serve a job needing `[macos, arm64]` vs `[linux]`. Agent must advertise its label set on connect so the dispatcher matches jobs to compatible agents.
+- ~~**Agent capability advertisement.**~~ Done: each poll carries the agent's label set, and the server offers a job only to an agent whose labels satisfy it (`domain.LabelsSatisfied`).
 
 ## v0.1.1 follow-up — operational maturity
 
