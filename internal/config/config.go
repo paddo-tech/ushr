@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +70,9 @@ type Org struct {
 	AppID          int64  `yaml:"app_id"`
 	PrivateKeyPath string `yaml:"private_key_path"`
 	Priority       int    `yaml:"priority,omitempty"`
+	// BaseURL is the GitHub Enterprise Server root (e.g.
+	// https://ghe.example.com). Empty means github.com.
+	BaseURL string `yaml:"base_url,omitempty"`
 	// RunnerGroupID is the GitHub runner group to register JIT runners into.
 	// Falls back to DefaultRunnerGroupID if zero.
 	RunnerGroupID int64 `yaml:"runner_group_id,omitempty"`
@@ -92,6 +96,8 @@ type RepoTarget struct {
 	AppID          int64  `yaml:"app_id"`
 	PrivateKeyPath string `yaml:"private_key_path"`
 	Priority       int    `yaml:"priority,omitempty"`
+	// BaseURL is the GitHub Enterprise Server root; empty means github.com.
+	BaseURL string `yaml:"base_url,omitempty"`
 }
 
 // Scope is the tenant scope ("owner/repo") this target serves; matches the
@@ -253,10 +259,37 @@ func LoadAgent(path string) (*Agent, error) {
 			}
 		}
 	}
+	for _, o := range a.Orgs {
+		if err := CheckBaseURL(o.BaseURL); err != nil {
+			return nil, fmt.Errorf("org %s: %w", o.Name, err)
+		}
+	}
+	for _, r := range a.Repos {
+		if err := CheckBaseURL(r.BaseURL); err != nil {
+			return nil, fmt.Errorf("repo %s: %w", r.Scope(), err)
+		}
+	}
 	if err := checkVersion(a.Version); err != nil {
 		return nil, err
 	}
 	return &a, nil
+}
+
+// CheckBaseURL accepts an empty base URL or the root of a GHES instance. The
+// API and App URLs are derived from it, so it must carry no path, and
+// github.com is spelled by leaving it empty.
+func CheckBaseURL(base string) error {
+	if base == "" {
+		return nil
+	}
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || strings.Trim(u.Path, "/") != "" {
+		return fmt.Errorf("base_url %q must be a GHES root such as https://ghe.example.com", base)
+	}
+	if strings.EqualFold(u.Hostname(), "github.com") {
+		return fmt.Errorf("base_url %q: leave base_url empty for github.com", base)
+	}
+	return nil
 }
 
 func orgInSet(set []string, org string) bool {

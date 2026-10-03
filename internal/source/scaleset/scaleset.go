@@ -175,12 +175,12 @@ func newClient(ctx context.Context, o config.Org, version string) (*scaleset.Cli
 	if err != nil {
 		return nil, fmt.Errorf("read app key: %w", err)
 	}
-	installID, err := gh.InstallationID(ctx, o.AppID, key, gh.AppAuth{Org: o.Name})
+	installID, err := gh.InstallationID(ctx, o.AppID, key, gh.AppAuth{Org: o.Name, BaseURL: o.BaseURL})
 	if err != nil {
 		return nil, err
 	}
 	return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: "https://github.com/" + o.Name,
+		GitHubConfigURL: gh.WebURL(o.BaseURL) + "/" + o.Name,
 		GitHubAppAuth: scaleset.GitHubAppAuth{
 			ClientID:       strconv.FormatInt(o.AppID, 10),
 			InstallationID: installID,
