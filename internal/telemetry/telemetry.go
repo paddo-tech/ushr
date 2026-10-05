@@ -1,6 +1,7 @@
 // Package telemetry persists the dispatch story the control plane otherwise
 // drops: finished jobs (job_runs), agent liveness (agent_status), and a live
-// transition feed (dispatch_events). Everything here is best-effort — a
+// transition feed (dispatch_events). Its daily sweep also enforces retention on
+// the enrollment tables that share the pool. Everything here is best-effort — a
 // telemetry failure must never fail dispatch — and hosted-only: the OSS
 // single-host controller gets the no-op Recorder.
 package telemetry
@@ -83,9 +84,36 @@ const queueDepth = 256
 // plenty for a dashboard.
 const heartbeatEvery = 5 * time.Second
 
-// retention bounds dispatch_events; job_runs and agent_status are small and
-// keep forever.
-const retention = 30 * 24 * time.Hour
+// Retention periods are published in the hosted privacy policy; change both together.
+const (
+	eventRetention   = "30 days"
+	jobRunRetention  = "13 months"
+	revokedRetention = "90 days"
+	sessionRetention = "1 day"
+)
+
+// retentionSweeps run in order: host status and runner apps of a revoked host
+// go first, because both find the host through its revoked agent_tokens rows.
+// A host counts as revoked only when none of its tokens is live or revoked inside
+// the window, so token rotation never deletes a running host's data.
+var retentionSweeps = []struct{ name, sql string }{
+	{"dispatch_events", `DELETE FROM dispatch_events WHERE at < now() - interval '` + eventRetention + `'`},
+	{"job_runs", `DELETE FROM job_runs
+		WHERE COALESCE(resolved_at, completed_at, started_at, claimed_at, offered_at, queued_at) < now() - interval '` + jobRunRetention + `'`},
+	{"agent_status", `DELETE FROM agent_status s
+		WHERE EXISTS (SELECT 1 FROM agent_tokens t WHERE t.orgs[1] || '/' || t.name = s.key)
+		AND NOT EXISTS (SELECT 1 FROM agent_tokens t WHERE t.orgs[1] || '/' || t.name = s.key
+			AND (t.revoked_at IS NULL OR t.revoked_at >= now() - interval '` + revokedRetention + `'))`},
+	{"runner_apps", `DELETE FROM runner_apps a USING agent_tokens origin
+		WHERE origin.token_hash = a.token_hash
+		AND NOT EXISTS (SELECT 1 FROM agent_tokens t
+			WHERE t.account_org_id = origin.account_org_id AND t.name = origin.name
+			AND (t.revoked_at IS NULL OR t.revoked_at >= now() - interval '` + revokedRetention + `'))`},
+	{"agent_tokens", `DELETE FROM agent_tokens t
+		WHERE t.revoked_at < now() - interval '` + revokedRetention + `'
+		AND NOT EXISTS (SELECT 1 FROM runner_apps a WHERE a.token_hash = t.token_hash)`},
+	{"cli_sessions", `DELETE FROM cli_sessions WHERE expires_at < now() - interval '` + sessionRetention + `'`},
+}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS job_runs (
@@ -216,12 +244,12 @@ func (p *PG) retentionLoop(ctx context.Context) {
 }
 
 func (p *PG) sweepRetention() {
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
-	defer cancel()
-	if _, err := p.pool.Exec(ctx,
-		`DELETE FROM dispatch_events WHERE at < now() - $1::interval`,
-		retention.String()); err != nil {
-		slog.Warn("telemetry retention sweep failed", "err", err)
+	for _, sweep := range retentionSweeps {
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+		if _, err := p.pool.Exec(ctx, sweep.sql); err != nil {
+			slog.Warn("telemetry retention sweep failed", "table", sweep.name, "err", err)
+		}
+		cancel()
 	}
 }
 
