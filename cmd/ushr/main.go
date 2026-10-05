@@ -68,7 +68,7 @@ subcommands:
            (local/OSS path; login runs this automatically when needed)
   doctor   check config, prereqs, service, and control-plane reachability
   init     rewrite a repo's workflow runs-on targets to ushr labels
-  cost     report runner-minutes served and $ saved vs GitHub-hosted
+  cost     report runner-minutes served and the GitHub-hosted cost avoided
   version  print version
   help     print this message`)
 }

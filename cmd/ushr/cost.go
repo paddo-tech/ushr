@@ -112,7 +112,7 @@ func aggregate(records []ledger.Record, since time.Time) []orgCost {
 func printCost(rows []orgCost, days int, rate float64) {
 	fmt.Printf("ushr cost — last %d days (rate $%.3f/runner-min)\n\n", days, rate)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.AlignRight)
-	_, _ = fmt.Fprintln(w, "ORG\tJOBS\tRUNNER-MIN\tSAVED\t")
+	_, _ = fmt.Fprintln(w, "ORG\tJOBS\tRUNNER-MIN\tAVOIDED\t")
 	var totJobs, totMin int
 	for _, r := range rows {
 		_, _ = fmt.Fprintf(w, "%s\t%d\t%d\t$%.2f\t\n", r.org, r.jobs, r.minutes, float64(r.minutes)*rate)
@@ -121,6 +121,7 @@ func printCost(rows []orgCost, days int, rate float64) {
 	}
 	_, _ = fmt.Fprintf(w, "TOTAL\t%d\t%d\t$%.2f\t\n", totJobs, totMin, float64(totMin)*rate)
 	_ = w.Flush()
+	fmt.Println("\nAVOIDED is runner-minutes x the GitHub-hosted rate, before hardware, power and any ushr fee.")
 }
 
 // backfillLedger scans each org's repos for completed jobs run on ushr runners
