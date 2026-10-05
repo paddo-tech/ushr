@@ -79,10 +79,10 @@ const opTimeout = 5 * time.Second
 // queue is full (DB stalled) new writes are dropped, not queued unboundedly.
 const queueDepth = 256
 
-// heartbeatEvery throttles agent_status writes: polls arrive up to every 25s
-// per agent but claim bursts can be much hotter, and liveness at 5s grain is
-// plenty for a dashboard.
-const heartbeatEvery = 5 * time.Second
+// heartbeatEvery throttles agent_status writes during claim bursts; idle polls
+// arrive about every 25s. It must stay well under the dashboard's 60s offline
+// threshold (fleet-bits.tsx in the web app).
+const heartbeatEvery = 20 * time.Second
 
 // Retention periods are published in the hosted privacy policy; change both together.
 const (
