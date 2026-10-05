@@ -25,6 +25,7 @@ const (
 
 // Session is the approved result the CLI writes into its config.
 type Session struct {
+	// Token is sealed to SessionMeta.PublicKey when the CLI sent one.
 	Token string
 	Orgs  []string
 	Name  string
@@ -42,6 +43,9 @@ type SessionMeta struct {
 	// UserCode is the short confirmation code the CLI prints; the approver
 	// checks it matches the page before approving (RFC 8628-style binding).
 	UserCode string
+	// PublicKey is the CLI's base64url X25519 key for this login. The web app
+	// seals the token to it. Empty from CLIs v0.2.10 and older.
+	PublicKey string
 }
 
 // Store authenticates enrollment tokens and drives the CLI login handshake.

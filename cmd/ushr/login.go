@@ -83,12 +83,17 @@ func runLogin(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("generate confirmation code: %w", err)
 		}
+		sealKey, err := enroll.NewSealKey()
+		if err != nil {
+			return fmt.Errorf("generate seal key: %w", err)
+		}
 
 		if err := postJSON(ctx, *cp+"/v1/cli/session", map[string]string{
 			"session_id": session,
 			"challenge":  enroll.Challenge(verifier),
 			"agent_name": agentName(*configPath),
 			"user_code":  userCode,
+			"public_key": enroll.SealPublicKey(sealKey),
 		}); err != nil {
 			return fmt.Errorf("start login session: %w", err)
 		}
@@ -106,6 +111,11 @@ func runLogin(ctx context.Context, args []string) error {
 		if err != nil {
 			fmt.Println()
 			return err
+		}
+		creds.Token, err = enroll.OpenSealed(sealKey, creds.Token)
+		if err != nil {
+			fmt.Println()
+			return fmt.Errorf("enrolled, but failed to open the token: %w — run `ushr login` again", err)
 		}
 		fmt.Println(" ✓")
 

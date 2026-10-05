@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-github/v84/github"
 	"github.com/paddo-tech/ushr/internal/config"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/enroll"
@@ -25,6 +27,9 @@ type hostedSetupState struct {
 	Slug     string `json:"slug"`
 	Secret   string `json:"secret"`
 	Key      string `json:"key"`
+	// SealKey is the X25519 private key the web app seals the manifest code to.
+	// Progress saved by CLIs v0.2.10 and older has none, and its code is plaintext.
+	SealKey []byte `json:"seal_key,omitempty"`
 }
 
 func setupRequest(ctx context.Context, method, url, token string, input, output any) (int, error) {
@@ -79,40 +84,45 @@ func hostedAppSetup(ctx context.Context, scope, keyDir, configPath, web, token s
 		}
 		return os.Rename(statePath+".tmp", statePath)
 	}
+	fresh := func() error {
+		key, err := enroll.NewSealKey()
+		if err != nil {
+			return err
+		}
+		state.SealKey = key.Bytes()
+		if state.ID, err = randomHex(32); err != nil {
+			return err
+		}
+		if state.Verifier, err = randToken(); err != nil {
+			return err
+		}
+		return save()
+	}
 	if state.ID == "" {
-		state.ID, err = randomHex(32)
-		if err != nil {
-			return err
-		}
-		state.Verifier, err = randToken()
-		if err != nil {
-			return err
-		}
-		if err := save(); err != nil {
+		if err := fresh(); err != nil {
 			return err
 		}
 	}
 	endpoint := strings.TrimRight(web, "/") + "/api/runner-setup"
 	if state.AppID == 0 {
-		status, err := setupRequest(ctx, http.MethodPost, endpoint, token, map[string]string{
-			"id": state.ID, "challenge": enroll.Challenge(state.Verifier), "scope": scope,
-		}, nil)
+		start := func() (int, error) {
+			body := map[string]string{"id": state.ID, "challenge": enroll.Challenge(state.Verifier), "scope": scope}
+			if state.SealKey != nil {
+				key, err := ecdh.X25519().NewPrivateKey(state.SealKey)
+				if err != nil {
+					return 0, err
+				}
+				body["publicKey"] = enroll.SealPublicKey(key)
+			}
+			return setupRequest(ctx, http.MethodPost, endpoint, token, body, nil)
+		}
+		status, err := start()
 		if status == http.StatusGone {
 			fmt.Println("==> GitHub approval expired. Starting a fresh approval.")
-			state.ID, err = randomHex(32)
-			if err != nil {
+			if err := fresh(); err != nil {
 				return err
 			}
-			state.Verifier, err = randToken()
-			if err != nil {
-				return err
-			}
-			if err := save(); err != nil {
-				return err
-			}
-			_, err = setupRequest(ctx, http.MethodPost, endpoint, token, map[string]string{
-				"id": state.ID, "challenge": enroll.Challenge(state.Verifier), "scope": scope,
-			}, nil)
+			_, err = start()
 		}
 		if err != nil {
 			return fmt.Errorf("start GitHub setup: %w", err)
@@ -143,7 +153,17 @@ func hostedAppSetup(ctx context.Context, scope, keyDir, configPath, web, token s
 			case <-tick.C:
 			}
 		}
-		app, err := exchangeCode(ctx, "", result.Code)
+		code := result.Code
+		var app *github.AppConfig
+		if state.SealKey != nil {
+			var key *ecdh.PrivateKey
+			if key, err = ecdh.X25519().NewPrivateKey(state.SealKey); err == nil {
+				code, err = enroll.OpenSealed(key, code)
+			}
+		}
+		if err == nil {
+			app, err = exchangeCode(ctx, "", code)
+		}
 		if err != nil {
 			// The one-time code may be spent even when the response is lost, so the next login starts over.
 			state = hostedSetupState{}
