@@ -692,7 +692,7 @@ func scrape(t *testing.T, url, token string) (int, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var body bytes.Buffer
 	_, _ = body.ReadFrom(resp.Body)
 	return resp.StatusCode, body.String()
