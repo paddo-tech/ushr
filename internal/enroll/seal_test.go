@@ -35,7 +35,7 @@ func seal(t *testing.T, pub *ecdh.PublicKey, plain string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return base64.RawURLEncoding.EncodeToString(gcm.Seal(eph.PublicKey().Bytes(), okm[32:], []byte(plain), nil))
+	return sealPrefix + base64.RawURLEncoding.EncodeToString(gcm.Seal(eph.PublicKey().Bytes(), okm[32:], []byte(plain), nil))
 }
 
 func TestSealRoundTrip(t *testing.T) {
@@ -63,10 +63,13 @@ func TestOpenWebSeal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got, err := Unseal(priv, "plain-token"); err != nil || got != "plain-token" {
+		t.Fatalf("unseal plaintext: %q, %v", got, err)
+	}
 	if got := SealPublicKey(priv); got != "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20" {
 		t.Fatalf("public key %q", got)
 	}
-	got, err := OpenSealed(priv, "R19AwTD4eVeynmFRz6CwaWNzlWvn7fuuoqiupyRrozYRu7HL6OEuV62CDxI7a5pF93n3oU7yAEcOfyAwoA")
+	got, err := OpenSealed(priv, "s1.R19AwTD4eVeynmFRz6CwaWNzlWvn7fuuoqiupyRrozYRu7HL6OEuV62CDxI7a5pF93n3oU7yAEcOfyAwoA")
 	if err != nil || got != "interop-token" {
 		t.Fatalf("open: %q, %v", got, err)
 	}

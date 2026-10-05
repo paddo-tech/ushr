@@ -158,7 +158,7 @@ func hostedAppSetup(ctx context.Context, scope, keyDir, configPath, web, token s
 		if state.SealKey != nil {
 			var key *ecdh.PrivateKey
 			if key, err = ecdh.X25519().NewPrivateKey(state.SealKey); err == nil {
-				code, err = enroll.OpenSealed(key, code)
+				code, err = enroll.Unseal(key, code)
 			}
 		}
 		if err == nil {

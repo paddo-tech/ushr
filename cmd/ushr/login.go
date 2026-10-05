@@ -112,7 +112,7 @@ func runLogin(ctx context.Context, args []string) error {
 			fmt.Println()
 			return err
 		}
-		creds.Token, err = enroll.OpenSealed(sealKey, creds.Token)
+		creds.Token, err = enroll.Unseal(sealKey, creds.Token)
 		if err != nil {
 			fmt.Println()
 			return fmt.Errorf("enrolled, but failed to open the token: %w — run `ushr login` again", err)

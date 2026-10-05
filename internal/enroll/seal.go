@@ -8,10 +8,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"strings"
 )
 
-// sealInfo must match SEAL_INFO in the web app's server/seal.ts.
-const sealInfo = "ushr-seal-v1"
+// sealInfo and sealPrefix must match SEAL_INFO and SEAL_PREFIX in the web
+// app's server/seal.ts. The prefix tells sealed values from the plaintext a
+// server older than the sealing change returns.
+const (
+	sealInfo   = "ushr-seal-v1"
+	sealPrefix = "s1."
+)
 
 // NewSealKey returns an ephemeral X25519 key pair for one login or setup flow.
 // The CLI sends the public half so the web app stores secrets sealed to it.
@@ -24,11 +30,24 @@ func SealPublicKey(priv *ecdh.PrivateKey) string {
 	return base64.RawURLEncoding.EncodeToString(priv.PublicKey().Bytes())
 }
 
-// OpenSealed decrypts base64url(ephemeral public key || AES-256-GCM ciphertext).
+// Unseal opens a sealed value and returns any other value as is. Plaintext
+// comes only from a server without sealing, over the same TLS channel.
+func Unseal(priv *ecdh.PrivateKey, v string) (string, error) {
+	if !strings.HasPrefix(v, sealPrefix) {
+		return v, nil
+	}
+	return OpenSealed(priv, v)
+}
+
+// OpenSealed decrypts "s1." + base64url(ephemeral public key || AES-256-GCM ciphertext).
 // HKDF-SHA256 over the X25519 shared secret, salted with both public keys,
 // yields the 32-byte key and 12-byte nonce; each seal uses a fresh ephemeral key.
 func OpenSealed(priv *ecdh.PrivateKey, sealed string) (string, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(sealed)
+	body, ok := strings.CutPrefix(sealed, sealPrefix)
+	if !ok {
+		return "", errors.New("value is not sealed")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		return "", err
 	}
