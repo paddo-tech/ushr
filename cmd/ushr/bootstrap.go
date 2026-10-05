@@ -174,10 +174,10 @@ func preflightTart(ctx context.Context, image string, assumeYes bool) error {
 			return errors.New("tart not found, and Homebrew isn't installed to get it.\n  Install Homebrew (https://brew.sh), then re-run — or install tart manually: https://tart.run")
 		}
 		fmt.Println("==> tart (the macOS VM engine) is not installed.")
-		if !confirm("    Install it now with `brew install cirruslabs/cli/tart`?", true, assumeYes) {
+		if !confirm("    Install it now with `brew install openai/tools/tart`?", true, assumeYes) {
 			return errors.New("tart is required for the tart driver — install it and re-run")
 		}
-		if err := runStream(ctx, "brew", "install", "cirruslabs/cli/tart"); err != nil {
+		if err := runStream(ctx, "brew", "install", "openai/tools/tart"); err != nil {
 			return fmt.Errorf("brew install tart: %w", err)
 		}
 	}
