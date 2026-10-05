@@ -51,7 +51,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	switch cfg.Driver.Type {
 	case config.DriverTypeTart, "":
 		_, tartErr := exec.LookPath("tart")
-		check(tartErr == nil, "tart installed", "brew install cirruslabs/cli/tart")
+		check(tartErr == nil, "tart installed", "brew install openai/tools/tart")
 		if tartErr == nil {
 			image := cfg.Driver.Image
 			if image == "" {

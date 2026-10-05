@@ -41,7 +41,7 @@ ushr setup --org YOUR_ORG
 ```
 
 Both are interactive but zero-edit: prereqs are offered as guided installs
-(`brew install tart`, image pulls, podman), the GitHub App flow is two browser
+(`brew install openai/tools/tart`, image pulls, podman), the GitHub App flow is two browser
 clicks, and the org block is written into `~/.config/ushr/agent.yaml` for you.
 On Linux the per-repo docker build cache is on by default.
 
