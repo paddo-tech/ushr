@@ -64,9 +64,12 @@ CREATE TABLE cli_sessions (
 );
 ```
 
-Token at rest: `agent_tokens` stores only the hash. `cli_sessions.token` holds
-the plaintext token transiently (short TTL, deleted on fetch, retrieval gated by
-the PKCE verifier) — the standard session-park tradeoff.
+Token at rest: `agent_tokens` stores only the hash. The CLI makes an ephemeral
+X25519 key pair per login and sends the public key as `public_key` on session
+create. The web app then writes `cli_sessions.token` sealed to that key
+(`internal/enroll/seal.go`, `server/seal.ts`), and only the CLI can open it.
+CLIs v0.2.10 and older send no key, so their row holds the plaintext token until
+fetch or expiry.
 
 ## hosted web app half (closed repo, separate)
 
@@ -91,6 +94,8 @@ The host creates a random setup ID and sends a verifier hash to `/api/runner-set
 The web app binds that request to the enrolled host and a verified GitHub scope.
 A workspace administrator must approve the GitHub flow.
 The callback checks its stored state before recording GitHub's temporary exchange code.
+The host sends a per-setup X25519 public key, and the web app seals the code to it.
+Setups from CLIs v0.2.10 and older send no key, and their code stays plaintext.
 The host authenticates and presents its verifier to retrieve that code.
 Only the host exchanges the code for its private key.
 The control plane receives the webhook secret, but never the private key.

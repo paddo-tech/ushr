@@ -18,7 +18,14 @@ const opTimeout = 5 * time.Second
 // Append-only: never edit an entry that has shaped the live database. All
 // entries share ONE transaction, so statements that can't run in a tx block
 // (CREATE INDEX CONCURRENTLY, VACUUM) are off-limits here.
-var migrations = []string{schemaV1, schemaV2, schemaV3}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
+
+// schemaV4 stores the CLI's per-flow X25519 public key. When it is set, the web
+// app writes cli_sessions.token and runner_apps.code sealed to it. Rows from
+// CLIs that send no key keep the plaintext value.
+const schemaV4 = `
+ALTER TABLE cli_sessions ADD COLUMN public_key text;
+ALTER TABLE runner_apps ADD COLUMN public_key text;`
 
 // schemaV3 holds each workspace's central priority per scope. The web app
 // writes it; scope is an org login or "owner/repo" in org_installations casing.
@@ -240,10 +247,10 @@ func (p *PG) CreateSession(id, challenge string, meta SessionMeta) error {
 		slog.Warn("prune cli_sessions failed", "err", err)
 	}
 	_, err := p.pool.Exec(ctx,
-		`INSERT INTO cli_sessions (id, challenge, agent_name, requester_ip, user_code, expires_at)
-		 VALUES ($1, $2, nullif($3, ''), nullif($4, ''), nullif($5, ''), now() + interval '10 minutes')
+		`INSERT INTO cli_sessions (id, challenge, agent_name, requester_ip, user_code, public_key, expires_at)
+		 VALUES ($1, $2, nullif($3, ''), nullif($4, ''), nullif($5, ''), nullif($6, ''), now() + interval '10 minutes')
 		 ON CONFLICT (id) DO NOTHING`,
-		id, challenge, meta.AgentName, meta.RequesterIP, meta.UserCode)
+		id, challenge, meta.AgentName, meta.RequesterIP, meta.UserCode, meta.PublicKey)
 	return err
 }
 

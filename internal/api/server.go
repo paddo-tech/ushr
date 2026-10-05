@@ -271,6 +271,7 @@ func (s *Server) handleCLISessionCreate(w http.ResponseWriter, r *http.Request) 
 		Challenge string `json:"challenge"`
 		AgentName string `json:"agent_name"`
 		UserCode  string `json:"user_code"`
+		PublicKey string `json:"public_key"`
 	}
 	// Unauthenticated endpoint: cap the body so decode-time memory is bounded.
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
@@ -282,6 +283,7 @@ func (s *Server) handleCLISessionCreate(w http.ResponseWriter, r *http.Request) 
 		AgentName:   clip(req.AgentName, 64),
 		UserCode:    clip(req.UserCode, 16),
 		RequesterIP: clientIP(r),
+		PublicKey:   clip(req.PublicKey, 64),
 	}
 	if err := s.enroll.CreateSession(req.SessionID, req.Challenge, meta); err != nil {
 		slog.Error("create cli session failed", "err", err)
