@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/paddo-tech/ushr/internal/actioncache"
 	"github.com/paddo-tech/ushr/internal/driver"
 )
 
@@ -68,6 +69,8 @@ type Options struct {
 	BuildCacheGB      int
 	BuildCacheIdleHrs int
 	StateDir          string
+	// ActionCache is the host action archive cache, mounted read-only.
+	ActionCache string
 	// Exclusive declares that no workload other than ushr's runners uses this
 	// daemon, which is what lets reclaim collect the containers, volumes and
 	// images jobs leave behind through the shared socket. Off by default: on a
@@ -104,7 +107,8 @@ type Driver struct {
 	// otherwise prune a builder the other is removing.
 	gcMu sync.Mutex
 
-	exclusive bool
+	exclusive   bool
+	actionCache string
 }
 
 var (
@@ -164,6 +168,7 @@ func New(opts Options) *Driver {
 		buildCacheIdle: time.Duration(opts.BuildCacheIdleHrs) * time.Hour,
 		stateDir:       opts.StateDir,
 		exclusive:      opts.Exclusive,
+		actionCache:    opts.ActionCache,
 		sharedGID:      sharedGID,
 	}
 }
@@ -259,6 +264,12 @@ func (d *Driver) Provision(ctx context.Context, req driver.ProvisionRequest) (dr
 				"-e", "BUILDX_CONFIG=/ushr/buildx",
 				"-e", "BUILDX_BUILDER="+builder)
 		}
+	}
+	// A missing bind source would be created root-owned by the daemon.
+	if fi, err := os.Stat(d.actionCache); err == nil && fi.IsDir() {
+		args = append(args,
+			"-v", d.actionCache+":/ushr/actions:ro",
+			"-e", actioncache.EnvVar+"=/ushr/actions")
 	}
 	args = append(args, "--entrypoint", d.entrypoint, d.image, "--jitconfig", req.JITToken)
 

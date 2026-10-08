@@ -32,6 +32,8 @@ type Options struct {
 	BaseImage string
 	SSHUser   string
 	Capacity  int
+	// ActionCache is the host action archive cache to share into each VM.
+	ActionCache string
 }
 
 // New constructs a tart-backed VM driver. Empty Options fields fall back to Default*.
@@ -46,9 +48,10 @@ func New(opts Options) *vmdriver.Driver {
 		opts.Capacity = DefaultCapacity
 	}
 	return vmdriver.New(commands{}, vmdriver.Config{
-		Base:     opts.BaseImage,
-		SSHUser:  opts.SSHUser,
-		Capacity: opts.Capacity,
+		Base:        opts.BaseImage,
+		SSHUser:     opts.SSHUser,
+		Capacity:    opts.Capacity,
+		ActionCache: opts.ActionCache,
 	})
 }
 
@@ -62,9 +65,14 @@ func (commands) Clone(ctx context.Context, base, name string) error {
 	return err
 }
 
-// Start launches `tart run --no-graphics` in the background.
-func (commands) Start(name string) error {
-	return exec.Command("tart", "run", name, "--no-graphics").Start()
+// Start launches `tart run --no-graphics` in the background. Naming the share
+// after its folder mounts it at /Volumes/My Shared Files/<folder>, as lume does.
+func (commands) Start(name, share string) error {
+	args := []string{"run", name, "--no-graphics"}
+	if share != "" {
+		args = append(args, "--dir="+filepath.Base(share)+":"+share+":ro")
+	}
+	return exec.Command("tart", args...).Start()
 }
 
 func (commands) Stop(ctx context.Context, name string) error {

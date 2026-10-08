@@ -49,6 +49,13 @@ func (m *Minter) Add(ctx context.Context, a gh.AppAuth, runnerGroupID int64) err
 	return nil
 }
 
+// Client returns the App client registered for scope, nil if none.
+func (m *Minter) Client(scope string) *github.Client {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clients[scope]
+}
+
 // Mint requests a JIT runner config for the job's scope under the previously
 // offered name. Repo scopes ("owner/repo") mint a repo-level runner; org scopes
 // mint an org-level one.

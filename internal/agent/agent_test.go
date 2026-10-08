@@ -388,6 +388,30 @@ func TestReclaimRunsOnlineTiersWhileWorking(t *testing.T) {
 	}
 }
 
+// recordingActions records its reclaim in the driver's tier log.
+type recordingActions struct{ drv *reclaimDriver }
+
+func (recordingActions) Fill(domain.Job)  {}
+func (r recordingActions) Reclaim() error { return r.drv.record("actions") }
+
+// The action cache is the cheapest thing to lose, so it goes before any driver tier.
+func TestReclaimEmptiesActionCacheFirst(t *testing.T) {
+	prev := reclaimInterval
+	t.Cleanup(func() { reclaimInterval = prev })
+	reclaimInterval = 5 * time.Millisecond
+
+	drv := &reclaimDriver{stuckDriver: &stuckDriver{diskPath: t.TempDir()}}
+	a := New("t1", nil, drv, nil, nil, nil, nil)
+	a.ReclaimFloor = math.MaxUint64 / 4
+	a.Actions = recordingActions{drv}
+	runReclaimLoop(t, a)
+
+	waitFor(t, "the online tier to run", func() bool { return contains(drv.ranTiers(), "online") })
+	if got := drv.ranTiers(); got[0] != "actions" {
+		t.Fatalf("tiers ran %v, want the action cache first", got)
+	}
+}
+
 // A drain-gated step must wait for the host to go quiet, and the host must
 // refuse work while it waits — that wait is the whole point of the drain.
 func TestDrainGatedTierWaitsForQuietHost(t *testing.T) {

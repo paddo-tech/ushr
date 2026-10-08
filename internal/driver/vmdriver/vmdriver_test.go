@@ -15,7 +15,7 @@ type fakeCmds struct {
 }
 
 func (f *fakeCmds) Clone(context.Context, string, string) error { return nil }
-func (f *fakeCmds) Start(string) error                          { return nil }
+func (f *fakeCmds) Start(string, string) error                  { return nil }
 func (f *fakeCmds) Stop(context.Context, string) error          { return nil }
 func (f *fakeCmds) Delete(_ context.Context, name string) error {
 	f.deleted = append(f.deleted, name)

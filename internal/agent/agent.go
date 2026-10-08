@@ -36,6 +36,13 @@ type DispatchObserver interface {
 	DispatchDone(handle string, failed bool)
 }
 
+// ActionCache keeps the host's action archive cache. Fill must not block: it
+// runs on the dispatch path.
+type ActionCache interface {
+	Fill(job domain.Job)
+	Reclaim() error
+}
+
 const (
 	pollRetryDelay = 5 * time.Second
 	statusTimeout  = 8 * time.Second  // shorter than statusInterval so a hung Status counts as an error
@@ -121,6 +128,10 @@ type Agent struct {
 	// Metrics receives the agent's series; served only when the operator sets
 	// a metrics listen address.
 	Metrics *metrics.Agent
+
+	// Actions, when set, is filled from each finished job and emptied first
+	// under disk pressure.
+	Actions ActionCache
 
 	minter      Minter
 	orgPriority map[string]int
@@ -435,6 +446,10 @@ func (a *Agent) reclaimLoop(ctx context.Context) {
 			"free_gb", u.Free>>30, "target_gb", target>>30)
 
 		tiers := r.ReclaimTiers(ctx)
+		if a.Actions != nil {
+			// Cheapest to lose: every archive is one download away.
+			tiers = append([]driver.Tier{{Name: "action cache", Run: a.Actions.Reclaim}}, tiers...)
+		}
 		free := a.runTiers(path, tiers, u.Free, target, false)
 		// Drain only once under the floor, never merely near it. There the host
 		// is already refusing work, so deselecting it to go quiet costs nothing
@@ -700,6 +715,9 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 	}
 	a.complete(o.JobID)
 	a.reportBudgeted(ctx, o.ID, api.DoneRequest{Status: "done"})
+	if a.Actions != nil {
+		a.Actions.Fill(job)
+	}
 	slog.Info("dispatch finished", "id", o.ID, "handle", handle)
 }
 

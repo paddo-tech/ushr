@@ -46,8 +46,10 @@ type Commands interface {
 	// Clone makes a copy-on-write copy of base as name.
 	Clone(ctx context.Context, base, name string) error
 	// Start boots name headless, detached so it survives the parent process
-	// (a controller restart can then reconcile live VMs via List).
-	Start(name string) error
+	// (a controller restart can then reconcile live VMs via List). A non-empty
+	// share is a host directory to expose read-only, at guestShare(share) in a
+	// macOS guest.
+	Start(name, share string) error
 	Stop(ctx context.Context, name string) error
 	Delete(ctx context.Context, name string) error
 	// List returns our VMs — those whose name matches prefix.
@@ -73,6 +75,14 @@ type Config struct {
 	Base     string
 	SSHUser  string
 	Capacity int
+	// ActionCache is the host's action archive cache directory, "" for none.
+	ActionCache string
+}
+
+// guestShare is where a macOS guest automounts a share: both CLIs use the
+// automount tag and name the share after the host folder.
+func guestShare(host string) string {
+	return filepath.Join("/Volumes/My Shared Files", filepath.Base(host))
 }
 
 // Driver is the generic VM driver, parameterized by a Commands implementation.
@@ -112,7 +122,11 @@ func (d *Driver) Provision(ctx context.Context, req driver.ProvisionRequest) (dr
 	if err := d.cmd.Clone(ctx, d.cfg.Base, name); err != nil {
 		return "", fmt.Errorf("clone %s -> %s: %w", d.cfg.Base, name, err)
 	}
-	if err := d.cmd.Start(name); err != nil {
+	share, guestCache := "", ""
+	if fi, err := os.Stat(d.cfg.ActionCache); err == nil && fi.IsDir() {
+		share, guestCache = d.cfg.ActionCache, guestShare(d.cfg.ActionCache)
+	}
+	if err := d.cmd.Start(name, share); err != nil {
 		// Nothing booted yet, so a plain delete is enough cleanup.
 		_ = d.cmd.Delete(context.Background(), name)
 		return "", fmt.Errorf("start %s: %w", name, err)
@@ -136,7 +150,7 @@ func (d *Driver) Provision(ctx context.Context, req driver.ProvisionRequest) (dr
 		d.mu.RLock()
 	}
 	// Cache cleanup must wait until the guest has received its archive.
-	err = sshrunner.InstallAndStart(ctx, d.cfg.SSHUser, ip, d.runner, req.JITToken)
+	err = sshrunner.InstallAndStart(ctx, d.cfg.SSHUser, ip, d.runner, req.JITToken, guestCache)
 	d.mu.RUnlock()
 	if err != nil {
 		_ = d.Destroy(context.Background(), handle)

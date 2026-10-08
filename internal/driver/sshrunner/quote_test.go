@@ -43,7 +43,7 @@ case "$*" in
     test "$RUNNER_TEST_MODE" != extract-failed ;;
   *"bash -s"*)
     printf 'start\n' >> "$RUNNER_TEST_LOG"
-    cat > /dev/null ;;
+    cat > "$RUNNER_TEST_LOG.script" ;;
   *) exit 1 ;;
 esac
 `,
@@ -56,7 +56,7 @@ test "$RUNNER_TEST_MODE" != copy-failed
 					t.Fatal(err)
 				}
 			}
-			err := InstallAndStart(context.Background(), "runner", "127.0.0.1", Runner{Version: "2.337.0", Tar: "runner.tar.gz"}, "test-jit")
+			err := InstallAndStart(context.Background(), "runner", "127.0.0.1", Runner{Version: "2.337.0", Tar: "runner.tar.gz"}, "test-jit", "/Volumes/My Shared Files/actions")
 			if (err != nil) != strings.HasSuffix(mode, "failed") {
 				t.Fatalf("unexpected install result: %v", err)
 			}
@@ -72,6 +72,16 @@ test "$RUNNER_TEST_MODE" != copy-failed
 			}[mode]
 			if string(commands) != want {
 				t.Fatalf("commands %q, want %q", commands, want)
+			}
+			if strings.HasSuffix(mode, "failed") {
+				return
+			}
+			script, readErr := os.ReadFile(log + ".script")
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(script), "export ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE='/Volumes/My Shared Files/actions'\n") {
+				t.Fatalf("script does not export the action cache:\n%s", script)
 			}
 		})
 	}

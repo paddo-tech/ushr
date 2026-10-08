@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/paddo-tech/ushr/internal/actioncache"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
 )
@@ -84,13 +85,19 @@ func StartedJob(ctx context.Context, user, ip string) (bool, error) {
 // script body, so the token can't break out of the shell quoting. The outer
 // shell receives it shell-quoted (one ssh-level reparse) and threads it into
 // the inner login shell via `_ "$1"`.
-func InstallAndStart(ctx context.Context, user, ip string, runner Runner, jitConfig string) error {
+//
+// A non-empty actionCache is the guest path of the action archive cache.
+func InstallAndStart(ctx context.Context, user, ip string, runner Runner, jitConfig, actionCache string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	if err := install(ctx, user, ip, runner); err != nil {
 		return err
 	}
-	script := fmt.Sprintf(`set -e
+	export := ""
+	if actionCache != "" {
+		export = fmt.Sprintf("export %s=%s\n", actioncache.EnvVar, shellQuote(actionCache))
+	}
+	script := export + fmt.Sprintf(`set -e
 cd ~/actions-runner
 nohup bash -lc './run.sh --jitconfig "$1"' _ "$1" > %s 2>&1 < /dev/null & disown
 sleep 2

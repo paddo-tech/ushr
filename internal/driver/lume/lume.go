@@ -29,6 +29,8 @@ type Options struct {
 	BaseImage string
 	SSHUser   string
 	Capacity  int
+	// ActionCache is the host action archive cache to share into each VM.
+	ActionCache string
 }
 
 // New constructs a lume-backed VM driver. Empty Options fields fall back to Default*.
@@ -43,9 +45,10 @@ func New(opts Options) *vmdriver.Driver {
 		opts.Capacity = DefaultCapacity
 	}
 	return vmdriver.New(commands{}, vmdriver.Config{
-		Base:     opts.BaseImage,
-		SSHUser:  opts.SSHUser,
-		Capacity: opts.Capacity,
+		Base:        opts.BaseImage,
+		SSHUser:     opts.SSHUser,
+		Capacity:    opts.Capacity,
+		ActionCache: opts.ActionCache,
 	})
 }
 
@@ -60,8 +63,12 @@ func (commands) Clone(ctx context.Context, base, name string) error {
 }
 
 // Start launches `lume run --no-display` in the background.
-func (commands) Start(name string) error {
-	return exec.Command("lume", "run", name, "--no-display").Start()
+func (commands) Start(name, share string) error {
+	args := []string{"run", name, "--no-display"}
+	if share != "" {
+		args = append(args, "--shared-dir", share+":ro")
+	}
+	return exec.Command("lume", args...).Start()
 }
 
 func (commands) Stop(ctx context.Context, name string) error {

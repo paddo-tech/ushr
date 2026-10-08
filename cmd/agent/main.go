@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/paddo-tech/ushr/internal/actioncache"
 	"github.com/paddo-tech/ushr/internal/agent"
 	"github.com/paddo-tech/ushr/internal/api"
 	"github.com/paddo-tech/ushr/internal/config"
@@ -102,6 +103,15 @@ func run(configPath string) error {
 	a.FailedVersion, a.FailedRequest, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
+	// Scale-set jobs carry no repo or GitHub job id, so only the poll source fills.
+	if m, ok := minter.(*jit.Minter); ok {
+		if c, err := actioncache.New(factory.ActionCacheDir(cfg.Driver), m.Client); err != nil {
+			slog.Warn("action cache disabled", "err", err)
+		} else {
+			a.Actions = c
+			go c.Run(ctx)
+		}
+	}
 
 	// Reap any VMs the previous process left behind (launchd SIGKILL/OOM, crash).
 	if err := a.ReconcileOrphans(ctx); err != nil {

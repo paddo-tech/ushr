@@ -64,6 +64,16 @@ Since 5 Jun 2026, Tart uses the
 [FSL-1.1-ALv2 license](https://github.com/openai/tart/blob/main/LICENSE).
 ushr also ships a Lume driver as a fallback. Set `driver.type: lume` in `agent.yaml` to use it.
 
+## Action cache
+
+Each host keeps a cache of the action archives that jobs use (`uses:`).
+After a job finishes, the agent reads the job log and downloads each listed action archive once.
+New runners then copy the archive from the host instead of downloading it from GitHub.
+The agent caches only actions from public repositories, because all orgs on a host share the cache.
+The cache is in `<state_dir>/actions` (default `~/.local/share/ushr/actions`) and holds at most 2 GB.
+Each runner gets the cache as a read-only mount, and `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE` gives its path.
+The scaleset source does not fill the cache.
+
 ## GitHub Enterprise Server
 
 ushr uses github.com by default.

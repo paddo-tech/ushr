@@ -6,7 +6,10 @@ package factory
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/paddo-tech/ushr/internal/actioncache"
 	"github.com/paddo-tech/ushr/internal/config"
 	"github.com/paddo-tech/ushr/internal/driver"
 	"github.com/paddo-tech/ushr/internal/driver/docker"
@@ -39,20 +42,37 @@ func New(cfg config.DriverConfig) (driver.Driver, error) {
 			BuildCacheIdleHrs: cfg.BuildCacheIdleHrs,
 			StateDir:          cfg.StateDir,
 			Exclusive:         cfg.ExclusiveDaemon,
+			ActionCache:       ActionCacheDir(cfg),
 		}), nil
 	case config.DriverTypeLume:
 		return lume.New(lume.Options{
-			BaseImage: cfg.Image,
-			Capacity:  cfg.Capacity,
+			BaseImage:   cfg.Image,
+			Capacity:    cfg.Capacity,
+			ActionCache: ActionCacheDir(cfg),
 		}), nil
 	case config.DriverTypeTart, "":
 		return tart.New(tart.Options{
-			BaseImage: cfg.Image,
-			Capacity:  cfg.Capacity,
+			BaseImage:   cfg.Image,
+			Capacity:    cfg.Capacity,
+			ActionCache: ActionCacheDir(cfg),
 		}), nil
 	default:
 		return nil, fmt.Errorf("unsupported driver type %q", cfg.Type)
 	}
+}
+
+// ActionCacheDir is the host's action archive cache under the agent state dir,
+// shared by every org on the host. "" when the home dir can't be resolved.
+func ActionCacheDir(cfg config.DriverConfig) string {
+	dir := cfg.StateDir
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".local", "share", "ushr")
+	}
+	return filepath.Join(dir, actioncache.DirName)
 }
 
 // MinFreeBytes resolves the free-space floor the admission gate uses: the
