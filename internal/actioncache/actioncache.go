@@ -41,6 +41,8 @@ const (
 	queueSize    = 64
 	fillTimeout  = 10 * time.Minute
 	maxRedirects = 3
+	// maxActions bounds the downloads one job can trigger.
+	maxActions = 32
 )
 
 // Action is one action repository at a resolved commit.
@@ -51,15 +53,25 @@ type Action struct {
 
 var downloadLine = regexp.MustCompile(`Download action repository '([^'@]+)@[^']*' \(SHA:([0-9a-fA-F]{40})\)`)
 
-// Parse returns the distinct actions a job log reports downloading, in order.
-// A subpath action (owner/repo/path) is cached under its repository.
-func Parse(r io.Reader) []Action {
+// firstStep marks the end of the runner's "Set up job" section. Lines after it
+// are step output a workflow controls, so a fake download line there must not
+// make the agent fetch arbitrary repositories.
+const firstStep = "##[group]Run "
+
+// Parse returns the distinct actions a job log's setup section reports
+// downloading, in order, at most maxActions. A subpath action (owner/repo/path)
+// is cached under its repository.
+func Parse(r io.Reader) ([]Action, error) {
 	var out []Action
 	seen := map[Action]bool{}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
-		m := downloadLine.FindStringSubmatch(sc.Text())
+	for len(out) < maxActions && sc.Scan() {
+		line := sc.Text()
+		if strings.Contains(line, firstStep) {
+			break
+		}
+		m := downloadLine.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
@@ -73,7 +85,7 @@ func Parse(r io.Reader) []Action {
 			out = append(out, a)
 		}
 	}
-	return out
+	return out, sc.Err()
 }
 
 // Path is where the runner looks for repo's archive at sha.
@@ -90,10 +102,7 @@ type Cache struct {
 	http   *http.Client
 	queue  chan domain.Job
 
-	mu sync.Mutex // serializes writes, eviction and reclaim
-
-	reposMu sync.Mutex
-	repos   map[string]string // lowercased owner/repo -> canonical name, "" if not public
+	mu sync.Mutex // serializes renames, eviction and reclaim
 }
 
 // New creates dir and returns a cache whose fills authenticate with the job
@@ -108,7 +117,6 @@ func New(dir string, client func(scope string) *github.Client) (*Cache, error) {
 		client:   client,
 		http:     &http.Client{Timeout: fillTimeout},
 		queue:    make(chan domain.Job, queueSize),
-		repos:    map[string]string{},
 	}, nil
 }
 
@@ -147,6 +155,11 @@ func (c *Cache) fill(ctx context.Context, job domain.Job) error {
 	if gc == nil {
 		return fmt.Errorf("no client for scope %q", job.Org)
 	}
+	// Paths carry no server, so a GHES repo could share a github.com repo's
+	// cache entry under the same name. Only github.com fills the cache.
+	if gc.BaseURL.Host != "api.github.com" {
+		return nil
+	}
 	owner, repo, ok := strings.Cut(job.Repo, "/")
 	if !ok {
 		return fmt.Errorf("bad repo %q", job.Repo)
@@ -159,9 +172,12 @@ func (c *Cache) fill(ctx context.Context, job domain.Job) error {
 	if err != nil {
 		return fmt.Errorf("job log: %w", err)
 	}
-	actions := Parse(body)
-	if err := body.Close(); err != nil {
-		return err
+	actions, err := Parse(body)
+	if cerr := body.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("job log: %w", err)
 	}
 	for _, a := range actions {
 		if err := c.store(ctx, gc, a); err != nil {
@@ -195,8 +211,6 @@ func (c *Cache) store(ctx context.Context, gc *github.Client, a Action) error {
 	}
 	defer func() { _ = body.Close() }()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -204,7 +218,12 @@ func (c *Cache) store(ctx context.Context, gc *github.Client, a Action) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(tmp, body)
+	// The download runs outside c.mu so a slow fill never stalls disk reclaim.
+	// An archive over the cap would evict the whole cache and then itself.
+	n, err := io.Copy(tmp, io.LimitReader(body, c.MaxBytes+1))
+	if err == nil && n > c.MaxBytes {
+		err = fmt.Errorf("archive exceeds %d bytes", c.MaxBytes)
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -212,10 +231,13 @@ func (c *Cache) store(ctx context.Context, gc *github.Client, a Action) error {
 	if err == nil {
 		err = os.Chmod(tmp.Name(), 0o644)
 	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), dst)
-	}
 	if err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := os.Rename(tmp.Name(), dst); err != nil {
 		_ = os.Remove(tmp.Name())
 		return err
 	}
@@ -224,28 +246,22 @@ func (c *Cache) store(ctx context.Context, gc *github.Client, a Action) error {
 
 // publicName returns the canonical owner/repo for a public repository and ""
 // for any other. The canonical case matters: the runner names the cache entry
-// from the resolved repository, not from what the workflow wrote.
+// from the resolved repository, not from what the workflow wrote. It asks
+// GitHub on every call: a repo can turn private at any time.
 func (c *Cache) publicName(ctx context.Context, gc *github.Client, repo string) (string, error) {
-	key := strings.ToLower(repo)
-	c.reposMu.Lock()
-	name, ok := c.repos[key]
-	c.reposMu.Unlock()
-	if ok {
-		return name, nil
-	}
 	owner, r, _ := strings.Cut(repo, "/")
 	info, resp, err := gc.Repositories.Get(ctx, owner, r)
-	if err != nil && (resp == nil || resp.StatusCode != http.StatusNotFound) {
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return "", nil
+		}
 		return "", err
 	}
 	// Internal repos report private; a repo this App can't see is not public.
-	if err == nil && !info.GetPrivate() {
-		name = info.GetFullName()
+	if info.GetPrivate() {
+		return "", nil
 	}
-	c.reposMu.Lock()
-	c.repos[key] = name
-	c.reposMu.Unlock()
-	return name, nil
+	return info.GetFullName(), nil
 }
 
 func (c *Cache) get(ctx context.Context, url string) (io.ReadCloser, error) {

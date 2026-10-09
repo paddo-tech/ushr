@@ -24,8 +24,13 @@ func TestParse(t *testing.T) {
 		"2026-10-09T01:02:03.4567890Z Download action repository 'actions/checkout@" + shaA + "' (SHA:" + shaA + ")",
 		"Download action repository 'nope@v1' (SHA:" + shaA + ")",
 		"Download action repository 'owner/repo@v1' (SHA:short)",
+		"2026-10-09T01:02:04.0000000Z ##[group]Run actions/checkout@v4",
+		"2026-10-09T01:02:05.0000000Z Download action repository 'torvalds/linux@master' (SHA:" + shaB + ")",
 	}, "\n")
-	got := Parse(strings.NewReader(log))
+	got, err := Parse(strings.NewReader(log))
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []Action{
 		{Repo: "actions/checkout", SHA: shaA},
 		{Repo: "github/codeql-action", SHA: shaB},
