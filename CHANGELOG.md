@@ -5,6 +5,8 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.13 — 2026-10-09
+
 - Releases sign `checksums.txt` with keyless cosign and publish an SBOM for
   each archive.
 - The installer verifies the cosign signature when cosign is installed.
