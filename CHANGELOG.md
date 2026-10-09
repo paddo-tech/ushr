@@ -12,9 +12,10 @@ The history in this repository starts at v0.2.4.
   GitHub assigns a JIT runner to any queued job with matching labels. The
   job the runner was minted for then stayed queued with no runner. The agent
   now reports when its runner takes a job, and the control plane frees the
-  offered job for a new offer. The poller re-reports a queued job on every
-  listing, and the agent drops a job it has not seen for three relist gaps.
-  Upgrade the control plane before the agents.
+  offered job for a new offer. The poller re-reports every queued job on
+  each pass. The agent drops a job only when a pass with no failed GitHub
+  call did not report it. Upgrade the control plane before the agents. To
+  roll the control plane back, see deploy/fly/README.md.
 
 ## v0.2.10 — 2026-09-29
 

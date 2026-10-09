@@ -28,6 +28,29 @@ fly deploy -c deploy/fly/fly.toml --dockerfile deploy/fly/Dockerfile
 Health: `https://ushr-cp.fly.dev/healthz` → 200. Point DNS `cp.ushr.io` at the
 app (`fly certs add cp.ushr.io`).
 
+## Roll back past the `started` dispatch state
+
+A control plane with the `started` state keeps a started row and a new row for
+the same job. An older control plane rebuilds a full unique index on
+`(lower(org), job_id)` at boot, and it fails to start if such pairs exist. It
+also does not know the `started` state. Run this against the Neon database
+before you deploy the older image:
+
+```sql
+BEGIN;
+-- A started row that shares its job with another row: drop the started one.
+-- Its runner still finishes; the done report for it becomes a no-op.
+DELETE FROM dispatches s
+WHERE s.state = 'started'
+  AND EXISTS (SELECT 1 FROM dispatches o
+              WHERE o.id <> s.id AND lower(o.org) = lower(s.org) AND o.job_id = s.job_id);
+UPDATE dispatches SET state = 'claimed' WHERE state = 'started';
+COMMIT;
+```
+
+Deploy the older image straight after, so no new started rows appear between
+the two steps.
+
 ## Point the Linux-box agent at it
 
 Enroll the box from its terminal:
