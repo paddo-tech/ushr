@@ -33,23 +33,39 @@ app (`fly certs add cp.ushr.io`).
 A control plane with the `started` state keeps a started row and a new row for
 the same job. An older control plane rebuilds a full unique index on
 `(lower(org), job_id)` at boot, and it fails to start if such pairs exist. It
-also does not know the `started` state. Run this against the Neon database
-before you deploy the older image:
+also does not know the `started` state. A running controller writes new
+started rows at any time, so no controller may run between the cleanup and the
+older controller's start.
 
-```sql
-BEGIN;
--- A started row that shares its job with another row: drop the started one.
--- Its runner still finishes; the done report for it becomes a no-op.
-DELETE FROM dispatches s
-WHERE s.state = 'started'
-  AND EXISTS (SELECT 1 FROM dispatches o
-              WHERE o.id <> s.id AND lower(o.org) = lower(s.org) AND o.job_id = s.job_id);
-UPDATE dispatches SET state = 'claimed' WHERE state = 'started';
-COMMIT;
-```
+1. Stop every controller machine. Scale to zero, not `fly machine stop`:
+   `auto_start_machines` restarts a stopped machine on the next agent poll.
 
-Deploy the older image straight after, so no new started rows appear between
-the two steps.
+   ```bash
+   fly scale count 0 -a ushr-cp
+   fly machine list -a ushr-cp      # must list no started machine
+   ```
+
+2. Run the cleanup against the Neon database:
+
+   ```sql
+   BEGIN;
+   -- A started row that shares its job with another row: drop the started one.
+   -- Its runner still finishes; the done report for it becomes a no-op.
+   DELETE FROM dispatches s
+   WHERE s.state = 'started'
+     AND EXISTS (SELECT 1 FROM dispatches o
+                 WHERE o.id <> s.id AND lower(o.org) = lower(s.org) AND o.job_id = s.job_id);
+   UPDATE dispatches SET state = 'claimed' WHERE state = 'started';
+   COMMIT;
+   ```
+
+3. Check out the older release tag and deploy it with the command under
+   Deploy. Keep the app at zero machines until this deploy starts one.
+4. Scale back to one machine if the deploy did not start one
+   (`fly scale count 1 -a ushr-cp`), and check `/healthz`.
+
+Agents keep their dispatches while the control plane is down. They retry their
+reports and resume polling when it returns.
 
 ## Point the Linux-box agent at it
 
