@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,35 +118,68 @@ func TestEmit_ReemitsStillQueuedJobOnEveryListing(t *testing.T) {
 	}
 }
 
-// fakeActions serves one repo's queued runs and their jobs. runs is the list of
-// queued run ids; failJobs makes every jobs listing fail.
+// fakeActions serves one repo's queued runs and their jobs, two pages of each.
+// Run ids in runs are split one per page when there are two; run N has jobs
+// 10N on page 1 and 10N+1 on page 2. failJobs fails every jobs listing and
+// failPage2 fails the second page of the run listing.
 type fakeActions struct {
-	mu       sync.Mutex
-	runs     []int64
-	failJobs bool
-	jobCalls int
+	mu        sync.Mutex
+	runs      []int64
+	failJobs  bool
+	failPage2 bool
+	jobCalls  int
 }
 
 func (f *fakeActions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	page2 := r.URL.Query().Get("page") == "2"
+	next := func() {
+		u := *r.URL
+		q := u.Query()
+		q.Set("page", "2")
+		u.RawQuery = q.Encode()
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s>; rel="next"`, r.Host, u.String()))
+	}
 	switch {
 	case r.URL.Path == "/api/v3/repos/o/r/actions/runs":
-		var runs []map[string]any
+		var ids []int64
 		if r.URL.Query().Get("status") == "queued" {
-			for _, id := range f.runs {
-				runs = append(runs, map[string]any{"id": id, "updated_at": "2026-01-01T00:00:00Z"})
+			ids = f.runs
+		}
+		if len(ids) > 1 {
+			if page2 {
+				if f.failPage2 {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return
+				}
+				ids = ids[1:]
+			} else {
+				ids = ids[:1]
+				next()
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(runs), "workflow_runs": runs})
+		runs := []map[string]any{}
+		for _, id := range ids {
+			runs = append(runs, map[string]any{"id": id, "updated_at": "2026-01-01T00:00:00Z"})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.runs), "workflow_runs": runs})
 	case strings.HasSuffix(r.URL.Path, "/jobs"):
 		f.jobCalls++
 		if f.failJobs {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "jobs": []map[string]any{
-			{"id": 7, "status": "queued", "labels": []string{"self-hosted"}},
+		var run int64
+		_, _ = fmt.Sscanf(r.URL.Path, "/api/v3/repos/o/r/actions/runs/%d/jobs", &run)
+		id := run * 10
+		if page2 {
+			id++
+		} else {
+			next()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 2, "jobs": []map[string]any{
+			{"id": id, "status": "queued", "labels": []string{"self-hosted"}},
 		}})
 	default:
 		http.NotFound(w, r)
@@ -164,61 +198,83 @@ func fakePoller(t *testing.T, f *fakeActions) (*Poller, orgClient) {
 	return newWithClients([]orgClient{c}, time.Hour), c
 }
 
-func pollOnce(t *testing.T, p *Poller, c orgClient) []int64 {
+// pollOnce runs one pass and returns the job ids it sent, in order, and the
+// pass marker's start (zero when the pass sent none).
+func pollOnce(t *testing.T, p *Poller, c orgClient) ([]int64, time.Time) {
 	t.Helper()
-	out := make(chan domain.Job, 8)
+	out := make(chan domain.Job, 16)
 	if err := p.pollOrg(context.Background(), c, p.breakers[c.scope()], out); err != nil {
 		t.Fatal(err)
 	}
 	close(out)
 	var ids []int64
+	var marker time.Time
 	for j := range out {
+		if !j.PassStart.IsZero() {
+			if j.Org != c.scope() {
+				t.Fatalf("marker for scope %q, want %q", j.Org, c.scope())
+			}
+			marker = j.PassStart
+			continue
+		}
+		if !marker.IsZero() {
+			t.Fatal("a job was sent after the pass marker")
+		}
 		ids = append(ids, j.JobID)
 	}
-	return ids
+	return ids, marker
 }
 
-// A clean pass re-sends every queued job, cached runs included, and advances
-// the scope's horizon. A run that leaves the listing stops being sent, so its
-// job falls behind the horizon: that is how the agent learns it is gone.
-func TestPollOrg_CleanPassReemitsAndAdvancesHorizon(t *testing.T) {
-	f := &fakeActions{runs: []int64{1}}
+// A clean pass reads every page, re-sends every queued job (cached runs
+// included), and ends with a marker the agent applies after the jobs. A run
+// that leaves the listing stops being sent, so its job falls behind the marker:
+// that is how the agent learns it is gone.
+func TestPollOrg_CleanPassReemitsAndMarks(t *testing.T) {
+	f := &fakeActions{runs: []int64{1, 2}}
 	p, c := fakePoller(t, f)
 
 	before := time.Now()
-	if got := pollOnce(t, p, c); len(got) != 1 || got[0] != 7 {
-		t.Fatalf("first pass emitted %v, want [7]", got)
+	ids, m1 := pollOnce(t, p, c)
+	if fmt.Sprint(ids) != "[10 11 20 21]" {
+		t.Fatalf("first pass sent %v, want both pages of runs and jobs [10 11 20 21]", ids)
 	}
-	h1 := p.Horizon(c.scope())
-	if h1.Before(before) {
-		t.Fatal("a clean pass must advance the horizon")
+	if m1.Before(before) {
+		t.Fatal("a clean pass must end with a marker")
 	}
-	if got := pollOnce(t, p, c); len(got) != 1 || got[0] != 7 {
-		t.Fatalf("cached pass emitted %v, want [7]", got)
+	ids, m2 := pollOnce(t, p, c)
+	if fmt.Sprint(ids) != "[10 11 20 21]" {
+		t.Fatalf("cached pass sent %v, want [10 11 20 21]", ids)
 	}
-	if f.jobCalls != 1 {
-		t.Fatalf("jobs listed %d times, want 1: an unchanged run is served from the cache", f.jobCalls)
+	if f.jobCalls != 4 {
+		t.Fatalf("jobs pages read %d times, want 4: an unchanged run is served from the cache", f.jobCalls)
 	}
-	if !p.Horizon(c.scope()).After(h1) {
-		t.Fatal("each clean pass must advance the horizon")
+	if !m2.After(m1) {
+		t.Fatal("each clean pass must mark a later start")
 	}
 
 	f.mu.Lock()
 	f.runs = nil
 	f.mu.Unlock()
-	if got := pollOnce(t, p, c); len(got) != 0 {
-		t.Fatalf("a run gone from the listing still emitted %v", got)
+	if ids, _ := pollOnce(t, p, c); len(ids) != 0 {
+		t.Fatalf("runs gone from the listing still sent %v", ids)
 	}
 }
 
-// A pass with a failed list call cannot prove a job gone, so it must leave the
-// horizon where it was.
-func TestPollOrg_FailedListingHoldsHorizon(t *testing.T) {
-	p, c := fakePoller(t, &fakeActions{runs: []int64{1}, failJobs: true})
-	if got := pollOnce(t, p, c); len(got) != 0 {
-		t.Fatalf("emitted %v from a failed listing", got)
-	}
-	if h := p.Horizon(c.scope()); !h.IsZero() {
-		t.Fatalf("horizon = %v after a failed pass, want zero", h)
+// A pass with a failed list call cannot prove a job gone, so it must end
+// without a marker. A failed later page counts: the runs it hid would
+// otherwise read as gone.
+func TestPollOrg_FailedListingSendsNoMarker(t *testing.T) {
+	for _, f := range []*fakeActions{
+		{runs: []int64{1}, failJobs: true},
+		{runs: []int64{1, 2}, failPage2: true},
+	} {
+		p, c := fakePoller(t, f)
+		ids, marker := pollOnce(t, p, c)
+		if !marker.IsZero() {
+			t.Fatalf("failJobs=%v failPage2=%v: a failed pass sent a marker", f.failJobs, f.failPage2)
+		}
+		if f.failPage2 && fmt.Sprint(ids) != "[10 11]" {
+			t.Fatalf("the page read before the failure should still be sent, got %v", ids)
+		}
 	}
 }

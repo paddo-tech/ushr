@@ -18,8 +18,8 @@ import (
 	gh "github.com/paddo-tech/ushr/internal/source/github"
 )
 
-// The poll source must hand the agent its horizon, or the agent falls back to
-// the 26 hour TTL and a job a runner took stays offered for a day.
+// The poll source must be the agent's freshness source, or the agent falls
+// back to the 26 hour TTL and a job a runner took stays offered for a day.
 func TestNewSourceWiresPollFreshness(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"id":42}`))

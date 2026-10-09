@@ -55,9 +55,6 @@ type Poller struct {
 	// jobs while unchanged: unchanged in_progress runs are the dominant
 	// rate-limit cost on a busy repo.
 	seenRuns map[int64]runState
-	// horizon is the start of each scope's last clean pass: one in which every
-	// list call succeeded, so every job it did not emit is no longer queued.
-	horizon map[string]time.Time
 }
 
 // runState records what we knew about a run at its last jobs-listing.
@@ -80,14 +77,6 @@ const (
 	// bounding map growth on a long-lived poller.
 	seenTTL = 24 * time.Hour
 )
-
-// Horizon returns the start of scope's last clean pass, zero before the first.
-// A job this source last emitted before it is no longer queued.
-func (p *Poller) Horizon(scope string) time.Time {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.horizon[scope]
-}
 
 // RelistGap bounds how stale an emitted job's state can be: a run is re-listed
 // at least this often, and its cached jobs are re-emitted until then.
@@ -129,7 +118,6 @@ func New(ctx context.Context, auths []AppAuth, interval time.Duration, m *metric
 		breakers: newBreakers(clients),
 		metrics:  m,
 		seenRuns: make(map[int64]runState),
-		horizon:  make(map[string]time.Time),
 	}, nil
 }
 
@@ -142,7 +130,6 @@ func newWithClients(clients []orgClient, interval time.Duration) *Poller {
 		breakers: newBreakers(clients),
 		metrics:  metrics.NewAgent(""),
 		seenRuns: make(map[int64]runState),
-		horizon:  make(map[string]time.Time),
 	}
 }
 
@@ -220,7 +207,9 @@ func (p *Poller) prune(now time.Time) {
 }
 
 // pollOrg polls queued/in_progress workflow runs and emits Jobs for queued
-// jobs. A pass with no failed list call advances the scope's horizon. It polls c.Repos when set (an explicit allowlist, which also
+// jobs. A clean pass, one with no failed list call, ends with a pass marker: a
+// Job carrying only Org and PassStart. It follows every job of the pass on the
+// same channel, so a consumer that applies it has seen them all. It polls c.Repos when set (an explicit allowlist, which also
 // avoids the list-installation-repos call); otherwise every repo the App
 // installation can access — which doesn't scale past a handful of repos against
 // the API rate limit.
@@ -256,11 +245,7 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 		// `needs:` stay queued until their deps finish. Polling only queued runs
 		// would strand every job after the first in a multi-job workflow.
 		for _, status := range []string{"queued", "in_progress"} {
-			// A run missing from the page would read as gone, so take the
-			// largest page GitHub serves.
-			runs, resp, err := c.Client.Actions.ListRepositoryWorkflowRuns(ctx, ref.owner, ref.name,
-				&github.ListWorkflowRunsOptions{Status: status, ListOptions: github.ListOptions{PerPage: 100}})
-			p.observe(c, b, err, resp)
+			runs, err := p.listRuns(ctx, c, b, ref.owner, ref.name, status)
 			// Stop the org's tick the moment the breaker trips — whether from
 			// this error (every remaining repo would fail the same way) or a
 			// low-water/secondary pause set on a successful observe — so we
@@ -271,13 +256,14 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 				}
 				return nil
 			}
+			// A failed later page still leaves the earlier pages worth sending,
+			// but a run it hid would read as gone, so the pass is not clean.
 			if err != nil {
 				slog.Warn("list runs failed", "repo", ref.owner+"/"+ref.name, "status", status, "err", err)
 				clean = false
-				continue
 			}
 			now := time.Now()
-			for _, run := range runs.WorkflowRuns {
+			for _, run := range runs {
 				if !b.ready(time.Now()) {
 					return nil // a jobs-list call tripped the breaker mid-loop
 				}
@@ -305,12 +291,30 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 			}
 		}
 	}
-	if clean && ctx.Err() == nil {
-		p.mu.Lock()
-		p.horizon[c.scope()] = start
-		p.mu.Unlock()
+	if clean {
+		p.emit(ctx, out, []domain.Job{{Org: c.scope(), PassStart: start}})
 	}
 	return nil
+}
+
+// listRuns lists every page of a repo's runs in status. A run missing from the
+// listing reads as gone, so a failed page returns the error with the runs read
+// so far. It stops early, without an error, when the breaker trips.
+func (p *Poller) listRuns(ctx context.Context, c orgClient, b *breaker, owner, repo, status string) ([]*github.WorkflowRun, error) {
+	opts := &github.ListWorkflowRunsOptions{Status: status, ListOptions: github.ListOptions{PerPage: 100}}
+	var runs []*github.WorkflowRun
+	for {
+		page, resp, err := c.Client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
+		p.observe(c, b, err, resp)
+		if err != nil {
+			return runs, err
+		}
+		runs = append(runs, page.WorkflowRuns...)
+		if resp.NextPage == 0 || !b.ready(time.Now()) {
+			return runs, nil
+		}
+		opts.Page = resp.NextPage
+	}
 }
 
 // listRunJobs fetches a run's jobs and returns one domain.Job per queued job,
@@ -319,20 +323,30 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 // exactly one job, so a multi-job run needs one runner each; and label routing
 // needs each job's own labels, which only the jobs API exposes.
 //
-// ok is false on a list error, leaving the run uncached so the next poll
-// retries it.
+// It reads every page. ok is false on a list error or a breaker trip on any
+// page, leaving the run uncached so the next poll retries it.
 func (p *Poller) listRunJobs(ctx context.Context, c orgClient, b *breaker, owner, repo string, run *github.WorkflowRun) ([]domain.Job, bool) {
-	jobs, resp, err := c.Client.Actions.ListWorkflowJobs(ctx, owner, repo, run.GetID(),
-		&github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}})
-	// This per-run call is the dominant rate-limit cost on a busy repo, so feed
-	// its outcome to the breaker too — otherwise an abuse/rate trip here would
-	// never pause the org.
-	p.observe(c, b, err, resp)
-	if err != nil {
-		slog.Warn("list jobs failed", "repo", owner+"/"+repo, "run", run.GetID(), "err", err)
-		return nil, false
+	opts := &github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}}
+	var all []*github.WorkflowJob
+	for {
+		jobs, resp, err := c.Client.Actions.ListWorkflowJobs(ctx, owner, repo, run.GetID(), opts)
+		// This per-run call is the dominant rate-limit cost on a busy repo, so
+		// feed its outcome to the breaker too: otherwise an abuse/rate trip
+		// here would never pause the org.
+		p.observe(c, b, err, resp)
+		if err != nil {
+			slog.Warn("list jobs failed", "repo", owner+"/"+repo, "run", run.GetID(), "err", err)
+			return nil, false
+		}
+		all = append(all, jobs.Jobs...)
+		if resp.NextPage == 0 {
+			return queuedJobs(c.scope(), repo, run, all), true
+		}
+		if !b.ready(time.Now()) {
+			return nil, false
+		}
+		opts.Page = resp.NextPage
 	}
-	return queuedJobs(c.scope(), repo, run, jobs.Jobs), true
 }
 
 // emit sends each job to out. Every pass re-sends a still-queued job, even one
