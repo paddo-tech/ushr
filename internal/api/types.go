@@ -14,7 +14,10 @@
 //     offer expired or is unknown — drop it. The agent then mints the JIT
 //     locally (its own key) and provisions.
 //
-// When a dispatch finishes, the agent POSTs its terminal status to
+// When the runner takes a job, the agent POSTs
+// /v1/agents/{name}/slots/{handle}/started. GitHub may give the runner a
+// different queued job, so the offered job is released for a new offer. When
+// a dispatch finishes, the agent POSTs its terminal status to
 // /v1/agents/{name}/slots/{handle}/done. The poll doubles as the agent's
 // heartbeat: the control plane holds even a zero-capacity poll open, so a
 // healthy agent is never silent for longer than the poll window.

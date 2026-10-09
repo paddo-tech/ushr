@@ -73,3 +73,31 @@ func TestLifecycle(t *testing.T) {
 		t.Fatalf("snapshot after resolve: want 0, got %d", got)
 	}
 }
+
+// A started dispatch keeps its row but no longer holds its offered job, so the
+// partial unique index admits one new unstarted dispatch of that job.
+func TestStartReleasesOfferedJob(t *testing.T) {
+	s := testStore(t)
+	if err := s.Offer(rec("ushr-a-7", "acme", 7)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Claim("ushr-a-7", time.Now(), nil); !ok {
+		t.Fatal("claim")
+	}
+	if _, ok, _ := s.Start("ushr-a-7", []string{"other"}); ok {
+		t.Fatal("another tenant must not start the dispatch")
+	}
+	r, ok, err := s.Start("ushr-a-7", []string{"ACME"})
+	if err != nil || !ok || r.State != dispatch.StateStarted {
+		t.Fatalf("start: ok=%v err=%v rec=%+v", ok, err, r)
+	}
+	if err := s.Offer(rec("ushr-b-7", "acme", 7)); err != nil {
+		t.Fatalf("offer after start: %v", err)
+	}
+	if err := s.Offer(rec("ushr-c-7", "Acme", 7)); !errors.Is(err, dispatch.ErrDuplicate) {
+		t.Fatalf("second unstarted dispatch: want ErrDuplicate, got %v", err)
+	}
+	if got := len(s.Snapshot()); got != 2 {
+		t.Fatalf("snapshot: want 2 live, got %d", got)
+	}
+}

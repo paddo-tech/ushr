@@ -14,6 +14,9 @@ type Store interface {
 	// tenant's dispatch by its (guessable) id. Empty wantOrgs skips the check
 	// (OSS single-host / sweeps).
 	Claim(id string, at time.Time, wantOrgs []string) (Record, bool, error)
+	// Start marks a claimed dispatch's runner as working, which frees its
+	// offered job to be offered again (see StateStarted).
+	Start(id string, wantOrgs []string) (Record, bool, error)
 	Resolve(id, status string, wantOrgs []string) (Record, bool, error)
 	Snapshot() []Record
 	// ExpireOffer removes a record only if it is still in the offered state,

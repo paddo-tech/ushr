@@ -109,6 +109,53 @@ func TestReplayDropsOfferedKeepsClaimed(t *testing.T) {
 	}
 }
 
+// A started runner may have taken a different job than the one it was offered,
+// so its record must stop blocking a new offer of that job while staying live.
+func TestStartReleasesOfferedJob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.jsonl")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Offer(rec("ushr-a-1", "mac1", 42)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := l.Start("ushr-a-1", nil); ok {
+		t.Fatal("an offered record must not start before it is claimed")
+	}
+	if _, ok, _ := l.Claim("ushr-a-1", time.Now(), nil); !ok {
+		t.Fatal("claim")
+	}
+	if err := l.Offer(rec("ushr-a-2", "mac1", 42)); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("claimed job re-offered: want ErrDuplicate, got %v", err)
+	}
+	if _, ok, _ := l.Start("ushr-a-1", []string{"other"}); ok {
+		t.Fatal("another tenant must not start the dispatch")
+	}
+	r, ok, err := l.Start("ushr-a-1", nil)
+	if err != nil || !ok || r.State != StateStarted {
+		t.Fatalf("start: ok=%v err=%v rec=%+v", ok, err, r)
+	}
+	if err := l.Offer(rec("ushr-a-2", "mac1", 42)); err != nil {
+		t.Fatalf("offer after start: %v", err)
+	}
+	if err := l.Offer(rec("ushr-a-3", "mac1", 42)); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("second unstarted dispatch of one job: want ErrDuplicate, got %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := l2.Snapshot()
+	if len(snap) != 1 || snap[0].ID != "ushr-a-1" || snap[0].State != StateStarted {
+		t.Fatalf("replay should keep only the started record, got %+v", snap)
+	}
+}
+
 func TestExpireOfferIsStateGuarded(t *testing.T) {
 	l, err := Open("")
 	if err != nil {

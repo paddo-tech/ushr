@@ -35,16 +35,18 @@ CREATE TABLE IF NOT EXISTS dispatches (
 	offered_at  timestamptz NOT NULL,
 	claimed_at  timestamptz
 );
--- One live dispatch per (org, job_id), matched case-insensitively: the agent
--- reports operator-typed org casing, so a case-sensitive key would let two
--- same-tenant agents with differing casing double-provision a job. Replaces the
--- older case-sensitive UNIQUE(org, job_id) constraint where present.
+-- One unstarted dispatch per (org, job_id), matched case-insensitively: the
+-- agent reports operator-typed org casing, so a case-sensitive key would let two
+-- same-tenant agents with differing casing double-provision a job. A started
+-- runner may have taken a different job, so its row no longer holds the offered
+-- one. Replaces the older full-table keys where present.
 ALTER TABLE dispatches DROP CONSTRAINT IF EXISTS dispatches_org_job_id_key;
-CREATE UNIQUE INDEX IF NOT EXISTS dispatches_org_lower_job_id ON dispatches (lower(org), job_id);`
+CREATE UNIQUE INDEX IF NOT EXISTS dispatches_org_lower_job_id_unstarted ON dispatches (lower(org), job_id) WHERE state <> 'started';
+DROP INDEX IF EXISTS dispatches_org_lower_job_id;`
 
 // Store implements dispatch.Store against Postgres. Resolving deletes the row,
-// so every row is a live dispatch and the UNIQUE(org, job_id) constraint gives
-// the same one-live-dispatch-per-job dedup as the JSONL ledger.
+// so every row is a live dispatch and the partial unique index gives the same
+// one-unstarted-dispatch-per-job dedup as the JSONL ledger.
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -107,6 +109,18 @@ func (s *Store) Claim(id string, at time.Time, wantOrgs []string) (dispatch.Reco
 		`UPDATE dispatches SET state = $2, claimed_at = $3
 		 WHERE id = $1 AND state = $4 AND (cardinality($5::text[]) = 0 OR lower(org) = ANY($5)) RETURNING `+cols,
 		id, dispatch.StateClaimed, at, dispatch.StateOffered, lowered(wantOrgs))
+	return scanOne(row)
+}
+
+// Start transitions claimed -> started. ok is false if the record is unknown,
+// not claimed, or owned by another tenant (org not in wantOrgs).
+func (s *Store) Start(id string, wantOrgs []string) (dispatch.Record, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	row := s.pool.QueryRow(ctx,
+		`UPDATE dispatches SET state = $2
+		 WHERE id = $1 AND state = $3 AND (cardinality($4::text[]) = 0 OR lower(org) = ANY($4)) RETURNING `+cols,
+		id, dispatch.StateStarted, dispatch.StateClaimed, lowered(wantOrgs))
 	return scanOne(row)
 }
 

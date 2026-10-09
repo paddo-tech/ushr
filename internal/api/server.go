@@ -107,7 +107,7 @@ func NewServer(boostPerMinute int, token string, led dispatch.Store, enr enroll.
 	// to them uniformly: a dead agent's claims resolve lost after agentDeadAfter
 	// instead of never.
 	for _, rec := range led.Snapshot() {
-		if rec.State == dispatch.StateClaimed {
+		if rec.State == dispatch.StateClaimed || rec.State == dispatch.StateStarted {
 			s.lastSeen[rec.Agent] = s.now()
 		}
 	}
@@ -158,6 +158,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/agents/{name}/poll", s.handlePoll)
 	mux.HandleFunc("POST /v1/agents/{name}/dispatches/{id}/claim", s.handleClaim)
+	mux.HandleFunc("POST /v1/agents/{name}/slots/{handle}/started", s.handleStarted)
 	mux.HandleFunc("POST /v1/agents/{name}/slots/{handle}/done", s.handleDone)
 	mux.HandleFunc("POST /v1/cli/session", s.handleCLISessionCreate)
 	mux.HandleFunc("POST /v1/cli/session/{id}/fetch", s.handleCLISessionFetch)
@@ -520,11 +521,15 @@ func (s *Server) pick(name string, orgs []string, req PollRequest, live map[stri
 	return best, bestWait, found
 }
 
-// liveJobs is the set of (org, job_id) already offered or claimed, so a
-// re-reported job isn't dispatched twice.
+// liveJobs is the set of (org, job_id) offered or claimed but not yet started,
+// so a re-reported job isn't dispatched twice. A started runner may be running
+// another job, so its offered job is open to a new offer if still reported.
 func liveJobs(snapshot []dispatch.Record) map[string]bool {
 	out := make(map[string]bool, len(snapshot))
 	for _, rec := range snapshot {
+		if rec.State == dispatch.StateStarted {
+			continue
+		}
 		out[jobKey(rec.Pending.Org, rec.Pending.JobID)] = true
 	}
 	return out
@@ -592,6 +597,22 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	s.telemetry.Event(rec.Pending.Org, id, "claimed",
 		map[string]any{"agent": rec.Agent, "job_id": rec.Pending.JobID})
 	// No mint here — the agent holds the key and mints the JIT itself.
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleStarted releases a dispatch's hold on its offered job once the runner
+// has taken a job. The agent's busy report still counts the slot.
+func (s *Server) handleStarted(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	handle := r.PathValue("handle")
+	orgs, ok := s.tenantFor(w, r, name)
+	if !ok {
+		return
+	}
+	s.heartbeat(livenessKey(orgs, name))
+	if _, _, err := s.ledger.Start(handle, orgs); err != nil {
+		slog.Warn("ledger start append failed", "id", handle, "err", err)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -720,7 +741,7 @@ func (s *Server) sweep(snapshot []dispatch.Record) []dispatch.Record {
 					continue
 				}
 			}
-		case dispatch.StateClaimed:
+		case dispatch.StateClaimed, dispatch.StateStarted:
 			s.mu.Lock()
 			seen, polled := s.lastSeen[rec.Agent]
 			s.mu.Unlock()

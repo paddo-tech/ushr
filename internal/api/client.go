@@ -83,6 +83,21 @@ func (c *Client) Claim(ctx context.Context, agent, id string) error {
 	}
 }
 
+// ReportStarted notifies the controller that a dispatch's runner has taken a
+// job, which may not be the job it was offered.
+func (c *Client) ReportStarted(ctx context.Context, agent, handle string) error {
+	url := fmt.Sprintf("%s/v1/agents/%s/slots/%s/started", c.BaseURL, agent, handle)
+	resp, err := c.do(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return errFromResponse(resp)
+	}
+	return nil
+}
+
 // ReportDone notifies the controller that a dispatch has finished.
 func (c *Client) ReportDone(ctx context.Context, agent, handle string, req DoneRequest) error {
 	body, err := json.Marshal(req)
