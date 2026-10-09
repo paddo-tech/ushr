@@ -3,7 +3,7 @@
 // JSONL write-ahead log, so a controller restart knows which dispatches were
 // outstanding instead of losing all state (the v0.1 failure mode).
 //
-// Lifecycle: offered -> claimed -> resolved (done/failed/lost/expired).
+// Lifecycle: offered -> claimed -> [started] -> resolved (done/failed/lost/expired).
 // Offered records do not survive a restart: no credential was minted, the job
 // is still queued on GitHub, and the poller will re-emit it. Claimed records
 // do survive: a runner may exist, so the server's sweeps decide their fate.
@@ -33,6 +33,11 @@ var ErrDuplicate = errors.New("dispatch already live")
 const (
 	StateOffered = "offered"
 	StateClaimed = "claimed"
+	// StateStarted is a claimed dispatch whose runner has taken a job. GitHub
+	// gives a JIT runner any queued job with matching labels, so the offered
+	// job may still be queued: a started record holds its slot but no longer
+	// holds that job.
+	StateStarted = "started"
 )
 
 // Record is one in-flight dispatch. ID is the runner name (fixed at offer
@@ -48,10 +53,10 @@ type Record struct {
 
 // event is one WAL line.
 type event struct {
-	Op     string    `json:"op"` // offer | claim | resolve
+	Op     string    `json:"op"` // offer | claim | start | resolve
 	At     time.Time `json:"at"`
 	Record *Record   `json:"record,omitempty"` // offer only
-	ID     string    `json:"id,omitempty"`     // claim/resolve
+	ID     string    `json:"id,omitempty"`     // claim/start/resolve
 	Status string    `json:"status,omitempty"` // resolve only
 }
 
@@ -147,6 +152,11 @@ func (l *Ledger) replay(path string) error {
 				r.ClaimedAt = e.At
 				l.live[e.ID] = r
 			}
+		case "start":
+			if r, ok := l.live[e.ID]; ok {
+				r.State = StateStarted
+				l.live[e.ID] = r
+			}
 		case "resolve":
 			delete(l.live, e.ID)
 		}
@@ -176,10 +186,10 @@ func (l *Ledger) append(e event) error {
 }
 
 // Offer records a new offered dispatch. Returns ErrDuplicate if the ID is
-// taken or the job already has a live dispatch under another ID — IDs embed
-// the agent name (poll source) or are random (scaleset), so a re-emitted job
-// offered to a different agent would otherwise slip past an ID-only check and
-// double-provision.
+// taken or the job already has an unstarted dispatch under another ID. IDs
+// embed the agent name (poll source) or are random (scaleset), so a re-emitted
+// job offered to a different agent would otherwise slip past an ID-only check
+// and double-provision.
 func (l *Ledger) Offer(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -189,7 +199,7 @@ func (l *Ledger) Offer(r Record) error {
 	for _, live := range l.live {
 		// Case-insensitive on org: the agent reports operator-typed casing, so a
 		// case-sensitive match would let differing casings double-dispatch a job.
-		if strings.EqualFold(live.Pending.Org, r.Pending.Org) && live.Pending.JobID == r.Pending.JobID {
+		if live.State != StateStarted && strings.EqualFold(live.Pending.Org, r.Pending.Org) && live.Pending.JobID == r.Pending.JobID {
 			return fmt.Errorf("job %d live as %q: %w", r.Pending.JobID, live.ID, ErrDuplicate)
 		}
 	}
@@ -228,6 +238,20 @@ func (l *Ledger) Claim(id string, at time.Time, wantOrgs []string) (Record, bool
 	r.ClaimedAt = at
 	l.live[id] = r
 	return r, true, l.append(event{Op: "claim", At: at, ID: id})
+}
+
+// Start transitions a claimed record to started, returning it. ok is false if
+// the record is unknown, not claimed, or owned by another tenant.
+func (l *Ledger) Start(id string, wantOrgs []string) (Record, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r, ok := l.live[id]
+	if !ok || r.State != StateClaimed || !orgMatches(wantOrgs, r.Pending.Org) {
+		return Record{}, false, nil
+	}
+	r.State = StateStarted
+	l.live[id] = r
+	return r, true, l.append(event{Op: "start", At: time.Now(), ID: id})
 }
 
 // Resolve removes a record in any live state, returning it. ok is false if the

@@ -370,6 +370,47 @@ func TestPollClaimDone(t *testing.T) {
 	}
 }
 
+// GitHub gave the runner minted for job 7 a different job, so job 7 is still
+// queued. Once the runner reports started, a re-report of job 7 must get a new
+// offer; until then it must not, or the job double-dispatches.
+func TestStartedReleasesOfferedJob(t *testing.T) {
+	led := memLedger(t)
+	s := NewServer(0, "secret", led, nil)
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	c := NewClient(srv.URL, "secret")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	labels := []string{"self-hosted"}
+	req := PollRequest{Capacity: 2, Labels: labels, Queues: oneJob("paddo-tech", 7, 0, labels...)}
+
+	first, err := c.Poll(ctx, "agent-1", req)
+	if err != nil || first == nil {
+		t.Fatalf("poll: err=%v offer=%v", err, first)
+	}
+	if err := c.Claim(ctx, "agent-1", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := s.pick("agent-2", nil, req, liveJobs(led.Snapshot())); ok {
+		t.Fatal("a claimed job was offered again before its runner started")
+	}
+
+	if err := c.ReportStarted(ctx, "agent-1", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	req.Busy = []string{first.ID}
+	second, err := c.Poll(ctx, "agent-1", req)
+	if err != nil || second == nil || second.JobID != 7 || second.ID == first.ID {
+		t.Fatalf("job 7 still queued after a swap must be re-offered: err=%v offer=%+v", err, second)
+	}
+	if _, _, ok := s.pick("agent-2", nil, req, liveJobs(led.Snapshot())); ok {
+		t.Fatal("the new dispatch must hold job 7 against a third offer")
+	}
+	if got := len(led.Snapshot()); got != 2 {
+		t.Fatalf("both dispatches should be live, len=%d", got)
+	}
+}
+
 func TestClaimUnknownOfferIsGone(t *testing.T) {
 	srv := httptest.NewServer(NewServer(0, "secret", memLedger(t), nil).Routes())
 	defer srv.Close()
@@ -537,11 +578,20 @@ func TestSweepLostOnDeadAgent(t *testing.T) {
 	if _, ok, _ := led.Claim("ushr-a-7", base, nil); !ok {
 		t.Fatal("claim")
 	}
+	if err := led.Offer(dispatch.Record{ID: "ushr-a-8", Agent: "a", OfferedAt: base, Pending: domain.Job{JobID: 8}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := led.Claim("ushr-a-8", base, nil); !ok {
+		t.Fatal("claim")
+	}
+	if _, ok, _ := led.Start("ushr-a-8", nil); !ok {
+		t.Fatal("start")
+	}
 	s.heartbeat("a")
 	base = base.Add(agentDeadAfter + time.Second)
 	s.sweep(led.Snapshot())
 	if got := len(led.Snapshot()); got != 0 {
-		t.Fatalf("dead agent's claim should be swept lost, len=%d", got)
+		t.Fatalf("dead agent's claimed and started dispatches should be swept lost, len=%d", got)
 	}
 }
 
