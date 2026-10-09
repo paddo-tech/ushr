@@ -103,6 +103,11 @@ func run(configPath string) error {
 	a.FailedVersion, a.FailedRequest, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
+	// Only the poll source re-reports a waiting job; scale-set jobs are emitted
+	// once and keep the default TTL.
+	if _, ok := minter.(*jit.Minter); ok {
+		a.QueueTTL = gh.QueueTTL(cfg.Source.Interval)
+	}
 	// Scale-set jobs carry no repo or GitHub job id, so only the poll source fills.
 	if m, ok := minter.(*jit.Minter); ok {
 		if c, err := actioncache.New(factory.ActionCacheDir(cfg.Driver), m.Client); err != nil {

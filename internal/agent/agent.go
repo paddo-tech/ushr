@@ -73,16 +73,9 @@ var drainWait = 20 * time.Minute
 // is collected on its own schedule rather than only under pressure.
 var reconcileInterval = 10 * time.Minute
 
-// queueTTL evicts a pending job the source has stopped re-reporting — one that
-// was cancelled, or that another host ran. GitHub never says a job left the
-// queue, so silence is the only signal there is.
-//
-// It must exceed the source's worst-case re-report period — the redispatch
-// window rounded up to the relist gap, which scales with the poll interval —
-// or a job genuinely still waiting would be dropped mid-wait. Re-reports
-// refresh the entry, so the value only bounds how long a dead job stays
-// pending; the slack costs at most one wasted VM.
-var queueTTL = 26 * time.Hour
+// defaultQueueTTL is the queue TTL for a source that emits each job once and
+// never re-reports it (scale sets), so silence there does not mean gone.
+const defaultQueueTTL = 26 * time.Hour
 
 // unblockDwell is how many consecutive clear samples end a block. One sample at
 // the boundary would flap: unblock, take a job, re-block, hand it back.
@@ -133,6 +126,15 @@ type Agent struct {
 	// under disk pressure.
 	Actions ActionCache
 
+	// QueueTTL evicts a pending job the source has stopped re-reporting: one
+	// that was cancelled, or that a runner (any runner) took. GitHub never says
+	// a job left the queue, so silence is the only signal there is. It must
+	// exceed the source's worst-case re-report period, or a job still waiting
+	// drops out of the report until the next re-report. Until it expires, a
+	// gone job can still be offered and mint a runner that idles to the
+	// startup-grace reap.
+	QueueTTL time.Duration
+
 	minter      Minter
 	orgPriority map[string]int
 	jobs        <-chan domain.Job // pending jobs polled from GitHub
@@ -150,7 +152,7 @@ type Agent struct {
 	busy       map[string]struct{}
 	unsent     map[string]api.DoneRequest // done-reports that failed to send, latest per handle
 	queue      map[int64]queued           // known-pending jobs, reported to the control plane
-	dispatched map[int64]bool             // jobs currently claimed/running, excluded from the report
+	dispatched map[int64]bool             // jobs claimed but not yet started, excluded from the report
 	wg         sync.WaitGroup             // tracks in-flight handleOffer goroutines
 }
 
@@ -172,6 +174,7 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		Driver:      drv,
 		Client:      client,
 		Metrics:     metrics.NewAgent(""),
+		QueueTTL:    defaultQueueTTL,
 		minter:      minter,
 		orgPriority: orgPriority,
 		jobs:        jobs,
@@ -687,7 +690,7 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 		return
 	}
 
-	slog.Info("dispatch received", "id", o.ID, "org", o.Org)
+	slog.Info("dispatch received", "id", o.ID, "org", o.Org, "job", o.JobID)
 	start := time.Now()
 	handle, err := a.Driver.Provision(ctx, driver.ProvisionRequest{
 		Name:     o.ID,
@@ -705,15 +708,32 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 		return
 	}
 	a.Metrics.ProvisionSeconds.Observe(time.Since(start).Seconds())
-	slog.Info("provisioned", "id", o.ID, "handle", handle)
-	a.waitForDone(ctx, handle)
+	slog.Info("provisioned", "id", o.ID, "handle", handle, "job", o.JobID)
+	// GitHub gives a JIT runner any queued job whose labels match, so the job
+	// the runner takes says nothing about the offered one. Forget the offered
+	// job once, at start or at the end if the runner never started: the source
+	// re-reports it if it is still queued. Forgetting it again at the end would
+	// drop a newer dispatch of the same job.
+	started := false
+	a.waitForDone(ctx, handle, func() {
+		started = true
+		a.forget(o.JobID)
+		slog.Info("runner took a job", "id", o.ID, "offered_job", o.JobID)
+		rc, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportBudget)
+		defer cancel()
+		if err := a.Client.ReportStarted(rc, a.Name, o.ID); err != nil {
+			slog.Warn("report started failed", "id", o.ID, "err", err)
+		}
+	})
 
 	destroyCtx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), destroyBudget)
 	defer dcancel()
 	if err := a.Driver.Destroy(destroyCtx, handle); err != nil {
 		slog.Warn("destroy failed", "handle", handle, "err", err)
 	}
-	a.complete(o.JobID)
+	if !started {
+		a.forget(o.JobID)
+	}
 	a.reportBudgeted(ctx, o.ID, api.DoneRequest{Status: "done"})
 	if a.Actions != nil {
 		a.Actions.Fill(job)
@@ -724,8 +744,8 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 // waitForDone polls Status until terminal or the consecutive-error budget is
 // exhausted. Each Status call gets its own short timeout so a wedged VM (which
 // can hang the underlying SSH/pgrep) trips the budget instead of starving the
-// loop forever.
-func (a *Agent) waitForDone(ctx context.Context, h driver.SlotHandle) {
+// loop forever. onStart runs once, when the runner is first seen on a job.
+func (a *Agent) waitForDone(ctx context.Context, h driver.SlotHandle, onStart func()) {
 	t := time.NewTicker(statusInterval)
 	defer t.Stop()
 	watcher, canWatch := a.Driver.(driver.JobWatcher)
@@ -760,6 +780,7 @@ func (a *Agent) waitForDone(ctx context.Context, h driver.SlotHandle) {
 			if canWatch && !jobStarted {
 				if a.startedJob(ctx, watcher, h) {
 					jobStarted = true
+					onStart()
 				} else if time.Now().After(startupDeadline) {
 					slog.Warn("runner idle past startup grace, reaping stranded slot", "handle", h, "grace", startupGrace)
 					return
@@ -835,7 +856,7 @@ func (a *Agent) flushReports(ctx context.Context) {
 }
 
 // reportQueues snapshots the pending jobs to report, grouped by org. Jobs
-// currently claimed/running are excluded.
+// claimed and not yet started are excluded.
 func (a *Agent) reportQueues() []api.OrgQueue {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -843,9 +864,9 @@ func (a *Agent) reportQueues() []api.OrgQueue {
 	byOrg := map[string][]api.QueuedJob{}
 	for id, q := range a.queue {
 		if a.dispatched[id] {
-			continue // in flight: the source stopped reporting it because it is running
+			continue // claimed: its runner is booting
 		}
-		if now.Sub(q.seen) > queueTTL {
+		if now.Sub(q.seen) > a.QueueTTL {
 			delete(a.queue, id)
 			continue
 		}
@@ -875,8 +896,8 @@ func (a *Agent) undispatch(jobID int64) {
 	a.mu.Unlock()
 }
 
-// complete drops a finished job from the queue entirely.
-func (a *Agent) complete(jobID int64) {
+// forget drops a job from the queue until the source reports it again.
+func (a *Agent) forget(jobID int64) {
 	a.mu.Lock()
 	delete(a.queue, jobID)
 	delete(a.dispatched, jobID)
