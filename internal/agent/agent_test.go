@@ -361,20 +361,28 @@ func TestDrainJobsDropsUnservableWork(t *testing.T) {
 	}
 }
 
+// fakeFreshness stands in for the poller's per-scope horizon.
+type fakeFreshness struct {
+	horizon map[string]time.Time
+	gap     time.Duration
+}
+
+func (f fakeFreshness) Horizon(scope string) time.Time { return f.horizon[scope] }
+func (f fakeFreshness) RelistGap() time.Duration       { return f.gap }
+
 // A job the source has stopped reporting is gone: cancelled, or taken by a
-// runner. GitHub never says so, so silence past the TTL is the only signal, and
-// a short TTL keeps a gone job from minting runners for long.
+// runner. GitHub never says so, so silence past the TTL is the only signal
+// when the source cannot say more.
 func TestReportQueuesEvictsStaleEntries(t *testing.T) {
 	a := New("t1", nil, &stuckDriver{}, nil, nil, nil, nil)
-	a.QueueTTL = 9 * time.Minute
 	a.mu.Lock()
 	a.queue[1] = queued{
 		job:  domain.Job{Org: "acme", JobID: 1, Labels: []string{"self-hosted"}},
-		seen: time.Now().Add(-10 * time.Minute),
+		seen: time.Now().Add(-2 * queueTTL),
 	}
 	a.queue[2] = queued{
 		job:  domain.Job{Org: "acme", JobID: 2, Labels: []string{"self-hosted"}},
-		seen: time.Now().Add(-8 * time.Minute),
+		seen: time.Now(),
 	}
 	a.mu.Unlock()
 
@@ -386,6 +394,183 @@ func TestReportQueuesEvictsStaleEntries(t *testing.T) {
 	defer a.mu.Unlock()
 	if _, ok := a.queue[1]; ok {
 		t.Fatal("the stale entry should have been evicted, not just hidden")
+	}
+}
+
+// With a fresh source, a job is gone only when a clean pass of its scope did
+// not re-emit it. A scope whose passes fail or pause keeps its jobs however
+// long the silence, so a job still waiting is never dropped.
+func TestReportQueuesEvictsBehindHorizon(t *testing.T) {
+	now := time.Now()
+	a := New("t1", nil, &stuckDriver{}, nil, nil, nil, nil)
+	a.Source = fakeFreshness{horizon: map[string]time.Time{"acme": now.Add(-time.Minute)}}
+	a.mu.Lock()
+	a.queue[1] = queued{job: domain.Job{Org: "acme", JobID: 1}, seen: now.Add(-2 * time.Minute)}
+	a.queue[2] = queued{job: domain.Job{Org: "acme", JobID: 2}, seen: now.Add(-30 * time.Second)}
+	a.queue[3] = queued{job: domain.Job{Org: "paused", JobID: 3}, seen: now.Add(-48 * time.Hour)}
+	a.mu.Unlock()
+
+	got := map[int64]bool{}
+	for _, q := range a.reportQueues() {
+		for _, j := range q.Jobs {
+			got[j.JobID] = true
+		}
+	}
+	if got[1] || !got[2] || !got[3] {
+		t.Fatalf("reported %v, want 2 and 3: only job 1 missed a clean pass", got)
+	}
+}
+
+// A listing read before the runner took the job can arrive after the agent
+// forgot it. The tombstone ignores re-emissions for one relist gap so that
+// stale listing cannot offer the job again; after it, a still-queued job is
+// taken back.
+func TestForgetStartedIgnoresStaleReemission(t *testing.T) {
+	jobs := make(chan domain.Job)
+	a := New("t1", []string{"self-hosted"}, &stuckDriver{}, nil, nil, nil, jobs)
+	a.Source = fakeFreshness{gap: 50 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.drainJobs(ctx)
+	has := func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		_, ok := a.queue[1]
+		return ok
+	}
+
+	a.forgetStarted(1)
+	jobs <- domain.Job{Org: "acme", JobID: 1, Labels: []string{"self-hosted"}}
+	jobs <- domain.Job{Org: "acme", JobID: 2, Labels: []string{"self-hosted"}} // drainJobs has handled job 1
+	if has() {
+		t.Fatal("a re-emission inside the tombstone re-queued the job")
+	}
+	time.Sleep(60 * time.Millisecond)
+	jobs <- domain.Job{Org: "acme", JobID: 1, Labels: []string{"self-hosted"}}
+	waitFor(t, "job 1 re-queued after the tombstone", has)
+}
+
+// gatedDriver runs one runner whose start and finish the test controls.
+type gatedDriver struct {
+	started, done atomic.Bool
+}
+
+func (d *gatedDriver) Capacity() int { return 1 }
+func (d *gatedDriver) Provision(context.Context, driver.ProvisionRequest) (driver.SlotHandle, error) {
+	return "h", nil
+}
+func (d *gatedDriver) Status(context.Context, driver.SlotHandle) (driver.Status, error) {
+	if d.done.Load() {
+		return driver.StatusDone, nil
+	}
+	return driver.StatusRunning, nil
+}
+func (d *gatedDriver) Destroy(context.Context, driver.SlotHandle) error  { return nil }
+func (d *gatedDriver) List(context.Context) ([]driver.SlotHandle, error) { return nil, nil }
+func (d *gatedDriver) StartedJob(context.Context, driver.SlotHandle) (bool, error) {
+	return d.started.Load(), nil
+}
+
+// okServer accepts every control-plane call.
+func okServer(t *testing.T) *api.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return api.NewClient(srv.URL, "")
+}
+
+func (a *Agent) holds(jobID int64) (inQueue, dispatched bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, inQueue = a.queue[jobID]
+	return inQueue, a.dispatched[jobID]
+}
+
+// A runner that never takes a job says nothing about its offered job, so the
+// dispatch end forgets it and the source re-reports it if still queued.
+func TestDispatchEndWithoutStartForgetsJob(t *testing.T) {
+	fastTimings(t)
+	a := New("t1", nil, &gatedDriver{}, okServer(t), e2eMinter{}, nil, nil)
+	a.mu.Lock()
+	a.queue[1] = queued{job: domain.Job{Org: "acme", JobID: 1}, seen: time.Now()}
+	a.mu.Unlock()
+	a.markDispatched(1)
+
+	a.handleDispatch(context.Background(), &api.Offer{ID: "d1", Org: "acme", JobID: 1})
+	if q, d := a.holds(1); q || d {
+		t.Fatalf("queued=%v dispatched=%v after an unstarted dispatch ended, want both false", q, d)
+	}
+}
+
+// A dispatch that started has already forgotten its offered job. If the job
+// was still queued and dispatched again, the first dispatch's end must leave
+// the newer dispatch's state alone.
+func TestDispatchEndAfterStartSparesNewerDispatch(t *testing.T) {
+	fastTimings(t)
+	drv := &gatedDriver{}
+	drv.started.Store(true)
+	a := New("t1", nil, drv, okServer(t), e2eMinter{}, nil, nil)
+	a.mu.Lock()
+	a.queue[1] = queued{job: domain.Job{Org: "acme", JobID: 1}, seen: time.Now()}
+	a.mu.Unlock()
+	a.markDispatched(1)
+
+	done := make(chan struct{})
+	go func() {
+		a.handleDispatch(context.Background(), &api.Offer{ID: "d1", Org: "acme", JobID: 1})
+		close(done)
+	}()
+	waitFor(t, "offered job forgotten at start", func() bool { q, d := a.holds(1); return !q && !d })
+
+	a.mu.Lock()
+	a.queue[1] = queued{job: domain.Job{Org: "acme", JobID: 1}, seen: time.Now()}
+	a.mu.Unlock()
+	a.markDispatched(1)
+	drv.done.Store(true)
+	<-done
+	if q, d := a.holds(1); !q || !d {
+		t.Fatalf("queued=%v dispatched=%v, want the newer dispatch kept", q, d)
+	}
+}
+
+// Until the control plane records a start, it keeps the offered job blocked.
+// A failed started-report (an outage, or an older control plane) must be
+// retried with the done-reports, and dropped once the dispatch is done.
+func TestStartedReportBuffersAndFlushes(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			http.NotFound(w, nil)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	a := New("t1", nil, &stuckDriver{}, api.NewClient(srv.URL, ""), nil, nil, nil)
+	pending := func() int {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return len(a.unstarted)
+	}
+	ctx := context.Background()
+
+	a.reportStarted(ctx, "d1")
+	a.reportStarted(ctx, "d2")
+	a.flushReports(ctx)
+	if pending() != 2 {
+		t.Fatalf("failed started reports pending = %d, want 2", pending())
+	}
+	fail.Store(false)
+	a.report(ctx, "d2", api.DoneRequest{Status: "done"})
+	if pending() != 1 {
+		t.Fatal("a done report must drop the dispatch's pending started report")
+	}
+	a.flushReports(ctx)
+	if pending() != 0 {
+		t.Fatalf("flush should deliver the started report, %d pending", pending())
 	}
 }
 

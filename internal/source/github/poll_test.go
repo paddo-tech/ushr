@@ -2,6 +2,11 @@ package github
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,7 +102,7 @@ func TestPrune_EvictsExpiredEntries(t *testing.T) {
 }
 
 // A runner minted for a job can take another one, leaving the first queued.
-// Only a re-emission puts it back in front of the scheduler, so every listing
+// Only a re-emission puts it back in front of the scheduler, so every pass
 // must re-send it, not just the first.
 func TestEmit_ReemitsStillQueuedJobOnEveryListing(t *testing.T) {
 	p := newWithClients(nil, time.Second)
@@ -112,17 +117,108 @@ func TestEmit_ReemitsStillQueuedJobOnEveryListing(t *testing.T) {
 	}
 }
 
-// The consumer's TTL must outlast the longest gap between re-emissions of a
-// waiting job (an unchanged run is re-listed every relistPolls polls), or the
-// job drops out of the report while it still waits.
-func TestQueueTTL_OutlastsRelistGap(t *testing.T) {
-	for _, interval := range []time.Duration{10 * time.Second, 30 * time.Second, time.Minute} {
-		gap := relistPolls * interval
-		if ttl := QueueTTL(interval); ttl < 2*gap {
-			t.Errorf("interval %s: TTL %s does not cover two relist gaps of %s", interval, ttl, gap)
+// fakeActions serves one repo's queued runs and their jobs. runs is the list of
+// queued run ids; failJobs makes every jobs listing fail.
+type fakeActions struct {
+	mu       sync.Mutex
+	runs     []int64
+	failJobs bool
+	jobCalls int
+}
+
+func (f *fakeActions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case r.URL.Path == "/api/v3/repos/o/r/actions/runs":
+		var runs []map[string]any
+		if r.URL.Query().Get("status") == "queued" {
+			for _, id := range f.runs {
+				runs = append(runs, map[string]any{"id": id, "updated_at": "2026-01-01T00:00:00Z"})
+			}
 		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(runs), "workflow_runs": runs})
+	case strings.HasSuffix(r.URL.Path, "/jobs"):
+		f.jobCalls++
+		if f.failJobs {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "jobs": []map[string]any{
+			{"id": 7, "status": "queued", "labels": []string{"self-hosted"}},
+		}})
+	default:
+		http.NotFound(w, r)
 	}
-	if got := QueueTTL(30 * time.Second); got > 10*time.Minute {
-		t.Errorf("TTL at a 30s interval = %s, want a few minutes so a gone job ages out quickly", got)
+}
+
+func fakePoller(t *testing.T, f *fakeActions) (*Poller, orgClient) {
+	t.Helper()
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	gc, err := NewClient(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := orgClient{Owner: "o", Repo: "r", Client: gc}
+	return newWithClients([]orgClient{c}, time.Hour), c
+}
+
+func pollOnce(t *testing.T, p *Poller, c orgClient) []int64 {
+	t.Helper()
+	out := make(chan domain.Job, 8)
+	if err := p.pollOrg(context.Background(), c, p.breakers[c.scope()], out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var ids []int64
+	for j := range out {
+		ids = append(ids, j.JobID)
+	}
+	return ids
+}
+
+// A clean pass re-sends every queued job, cached runs included, and advances
+// the scope's horizon. A run that leaves the listing stops being sent, so its
+// job falls behind the horizon: that is how the agent learns it is gone.
+func TestPollOrg_CleanPassReemitsAndAdvancesHorizon(t *testing.T) {
+	f := &fakeActions{runs: []int64{1}}
+	p, c := fakePoller(t, f)
+
+	before := time.Now()
+	if got := pollOnce(t, p, c); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("first pass emitted %v, want [7]", got)
+	}
+	h1 := p.Horizon(c.scope())
+	if h1.Before(before) {
+		t.Fatal("a clean pass must advance the horizon")
+	}
+	if got := pollOnce(t, p, c); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("cached pass emitted %v, want [7]", got)
+	}
+	if f.jobCalls != 1 {
+		t.Fatalf("jobs listed %d times, want 1: an unchanged run is served from the cache", f.jobCalls)
+	}
+	if !p.Horizon(c.scope()).After(h1) {
+		t.Fatal("each clean pass must advance the horizon")
+	}
+
+	f.mu.Lock()
+	f.runs = nil
+	f.mu.Unlock()
+	if got := pollOnce(t, p, c); len(got) != 0 {
+		t.Fatalf("a run gone from the listing still emitted %v", got)
+	}
+}
+
+// A pass with a failed list call cannot prove a job gone, so it must leave the
+// horizon where it was.
+func TestPollOrg_FailedListingHoldsHorizon(t *testing.T) {
+	p, c := fakePoller(t, &fakeActions{runs: []int64{1}, failJobs: true})
+	if got := pollOnce(t, p, c); len(got) != 0 {
+		t.Fatalf("emitted %v from a failed listing", got)
+	}
+	if h := p.Horizon(c.scope()); !h.IsZero() {
+		t.Fatalf("horizon = %v after a failed pass, want zero", h)
 	}
 }
