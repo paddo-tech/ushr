@@ -361,14 +361,10 @@ func TestDrainJobsDropsUnservableWork(t *testing.T) {
 	}
 }
 
-// fakeFreshness stands in for the poller's per-scope horizon.
-type fakeFreshness struct {
-	horizon map[string]time.Time
-	gap     time.Duration
-}
+// fakeFreshness stands in for the poller's relist gap.
+type fakeFreshness struct{ gap time.Duration }
 
-func (f fakeFreshness) Horizon(scope string) time.Time { return f.horizon[scope] }
-func (f fakeFreshness) RelistGap() time.Duration       { return f.gap }
+func (f fakeFreshness) RelistGap() time.Duration { return f.gap }
 
 // A job the source has stopped reporting is gone: cancelled, or taken by a
 // runner. GitHub never says so, so silence past the TTL is the only signal
@@ -397,18 +393,29 @@ func TestReportQueuesEvictsStaleEntries(t *testing.T) {
 	}
 }
 
-// With a fresh source, a job is gone only when a clean pass of its scope did
-// not re-emit it. A scope whose passes fail or pause keeps its jobs however
-// long the silence, so a job still waiting is never dropped.
-func TestReportQueuesEvictsBehindHorizon(t *testing.T) {
-	now := time.Now()
-	a := New("t1", nil, &stuckDriver{}, nil, nil, nil, nil)
-	a.Source = fakeFreshness{horizon: map[string]time.Time{"acme": now.Add(-time.Minute)}}
-	a.mu.Lock()
-	a.queue[1] = queued{job: domain.Job{Org: "acme", JobID: 1}, seen: now.Add(-2 * time.Minute)}
-	a.queue[2] = queued{job: domain.Job{Org: "acme", JobID: 2}, seen: now.Add(-30 * time.Second)}
-	a.queue[3] = queued{job: domain.Job{Org: "paused", JobID: 3}, seen: now.Add(-48 * time.Hour)}
-	a.mu.Unlock()
+// With a fresh source, a job is gone only when the last clean pass of its
+// scope did not send it. The pass marker follows the pass's jobs on the same
+// channel, so a job the pass re-sent is never compared with a newer marker
+// than the one it arrived ahead of. A scope with no clean pass keeps its jobs
+// however long the silence, so a job still waiting is never dropped.
+func TestReportQueuesEvictsBehindPassMarker(t *testing.T) {
+	jobs := make(chan domain.Job)
+	a := New("t1", []string{"self-hosted"}, &stuckDriver{}, nil, nil, nil, jobs)
+	a.Source = fakeFreshness{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.drainJobs(ctx)
+	job := func(org string, id int64) domain.Job {
+		return domain.Job{Org: org, JobID: id, Labels: []string{"self-hosted"}}
+	}
+
+	jobs <- job("acme", 1)
+	jobs <- job("paused", 3)
+	time.Sleep(5 * time.Millisecond)
+	pass := time.Now()
+	jobs <- job("acme", 2) // the pass re-sends job 2 only
+	jobs <- domain.Job{Org: "acme", PassStart: pass}
+	jobs <- job("acme", 9) // drainJobs has applied the marker
 
 	got := map[int64]bool{}
 	for _, q := range a.reportQueues() {
@@ -417,7 +424,7 @@ func TestReportQueuesEvictsBehindHorizon(t *testing.T) {
 		}
 	}
 	if got[1] || !got[2] || !got[3] {
-		t.Fatalf("reported %v, want 2 and 3: only job 1 missed a clean pass", got)
+		t.Fatalf("reported %v, want 2 and 3: only job 1 missed the clean pass", got)
 	}
 }
 

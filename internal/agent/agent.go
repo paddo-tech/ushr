@@ -37,12 +37,9 @@ type DispatchObserver interface {
 }
 
 // Freshness is implemented by a source that re-emits every job still queued
-// on each clean pass (the GitHub poller). Without it the agent can only age
-// jobs out by queueTTL.
+// on each clean pass and ends the pass with a marker (domain.Job.PassStart):
+// the GitHub poller. Without it the agent can only age jobs out by queueTTL.
 type Freshness interface {
-	// Horizon is the start of scope's last clean pass, zero before the first.
-	// A job last emitted before it is no longer queued.
-	Horizon(scope string) time.Time
 	// RelistGap bounds how stale an emitted job's state can be.
 	RelistGap() time.Duration
 }
@@ -139,8 +136,8 @@ type Agent struct {
 	Actions ActionCache
 
 	// Source, when set, says when a pending job has left GitHub's queue: it
-	// was not re-emitted by a clean pass of its scope. A paused or failing
-	// scope evicts nothing, so a job still waiting is never dropped.
+	// was not re-emitted by the last clean pass of its scope. A paused or
+	// failing scope evicts nothing, so a job still waiting is never dropped.
 	Source Freshness
 
 	minter      Minter
@@ -162,6 +159,7 @@ type Agent struct {
 	queue      map[int64]queued           // known-pending jobs, reported to the control plane
 	dispatched map[int64]bool             // jobs claimed but not yet started, excluded from the report
 	tombstone  map[int64]time.Time        // jobs forgotten at runner start, ignored until the time given
+	horizon    map[string]time.Time       // start of each scope's last clean pass, from the source's markers
 	unstarted  map[string]struct{}        // started-reports that failed to send, by handle
 	wg         sync.WaitGroup             // tracks in-flight handleOffer goroutines
 }
@@ -193,6 +191,7 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		queue:       make(map[int64]queued),
 		dispatched:  make(map[int64]bool),
 		tombstone:   make(map[int64]time.Time),
+		horizon:     make(map[string]time.Time),
 		unstarted:   make(map[string]struct{}),
 	}
 }
@@ -374,6 +373,14 @@ func (a *Agent) drainJobs(ctx context.Context) {
 		case j, ok := <-a.jobs:
 			if !ok {
 				return
+			}
+			// Every job of the pass was applied before its marker arrives, on
+			// this same goroutine, so none can read as missed.
+			if !j.PassStart.IsZero() {
+				a.mu.Lock()
+				a.horizon[j.Org] = j.PassStart
+				a.mu.Unlock()
+				continue
 			}
 			// Only work this host could actually be given. The control plane
 			// applies the same test before offering, so reporting anything else
@@ -954,7 +961,7 @@ func (a *Agent) undispatch(jobID int64) {
 // clean pass of its scope, or past queueTTL when the source cannot say.
 func (a *Agent) gone(q queued, now time.Time) bool {
 	if a.Source != nil {
-		return q.seen.Before(a.Source.Horizon(q.job.Org))
+		return q.seen.Before(a.horizon[q.job.Org])
 	}
 	return now.Sub(q.seen) > queueTTL
 }
@@ -962,14 +969,16 @@ func (a *Agent) gone(q queued, now time.Time) bool {
 // forgetStarted forgets a job whose runner took a job. The source can still
 // hold a listing taken before the job left the queue, so re-emissions are
 // ignored for one relist gap: long enough for the source to see the change.
+// The delete and the tombstone share one lock, or drainJobs could re-add the
+// job between them.
 func (a *Agent) forgetStarted(jobID int64) {
-	a.forget(jobID)
-	if a.Source == nil {
-		return
-	}
 	a.mu.Lock()
-	a.tombstone[jobID] = time.Now().Add(a.Source.RelistGap())
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	delete(a.queue, jobID)
+	delete(a.dispatched, jobID)
+	if a.Source != nil {
+		a.tombstone[jobID] = time.Now().Add(a.Source.RelistGap())
+	}
 }
 
 // forget drops a job from the queue until the source reports it again.

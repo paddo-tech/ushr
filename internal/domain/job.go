@@ -41,6 +41,12 @@ type Job struct {
 	JobID    int64
 	Labels   []string
 	QueuedAt time.Time
+
+	// PassStart, when set, makes this a pass marker that carries no work: the
+	// source finished a clean pass over Org that began at PassStart, and has
+	// already sent every job still queued there. A job the consumer last
+	// received before PassStart is no longer queued.
+	PassStart time.Time
 }
 
 // SplitRepoScope splits an "owner/repo" scope. ok is false for an org scope (a
