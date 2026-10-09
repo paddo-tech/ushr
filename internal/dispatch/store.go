@@ -15,8 +15,10 @@ type Store interface {
 	// (OSS single-host / sweeps).
 	Claim(id string, at time.Time, wantOrgs []string) (Record, bool, error)
 	// Start marks a claimed dispatch's runner as working, which frees its
-	// offered job to be offered again (see StateStarted).
-	Start(id string, wantOrgs []string) (Record, bool, error)
+	// offered job to be offered again (see StateStarted). Only the agent that
+	// holds the dispatch may start it: another agent of the same tenant would
+	// otherwise free a booting runner's job for a second dispatch.
+	Start(id, agent string, wantOrgs []string) (Record, bool, error)
 	Resolve(id, status string, wantOrgs []string) (Record, bool, error)
 	Snapshot() []Record
 	// ExpireOffer removes a record only if it is still in the offered state,

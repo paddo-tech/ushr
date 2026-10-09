@@ -113,14 +113,14 @@ func (s *Store) Claim(id string, at time.Time, wantOrgs []string) (dispatch.Reco
 }
 
 // Start transitions claimed -> started. ok is false if the record is unknown,
-// not claimed, or owned by another tenant (org not in wantOrgs).
-func (s *Store) Start(id string, wantOrgs []string) (dispatch.Record, bool, error) {
+// not claimed, held by another agent, or owned by another tenant.
+func (s *Store) Start(id, agent string, wantOrgs []string) (dispatch.Record, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
 	row := s.pool.QueryRow(ctx,
 		`UPDATE dispatches SET state = $2
-		 WHERE id = $1 AND state = $3 AND (cardinality($4::text[]) = 0 OR lower(org) = ANY($4)) RETURNING `+cols,
-		id, dispatch.StateStarted, dispatch.StateClaimed, lowered(wantOrgs))
+		 WHERE id = $1 AND state = $3 AND agent = $4 AND (cardinality($5::text[]) = 0 OR lower(org) = ANY($5)) RETURNING `+cols,
+		id, dispatch.StateStarted, dispatch.StateClaimed, agent, lowered(wantOrgs))
 	return scanOne(row)
 }
 

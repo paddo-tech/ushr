@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -179,6 +180,91 @@ func TestCrossTenantClaimDoneRejected(t *testing.T) {
 	}
 	if got := len(led.Snapshot()); got != 1 {
 		t.Fatalf("victim's dispatch must survive, len=%d", got)
+	}
+}
+
+// eventRecorder records live-feed events.
+type eventRecorder struct {
+	telemetry.Noop
+	mu     sync.Mutex
+	events []string
+}
+
+func (e *eventRecorder) Event(_, _, event string, _ map[string]any) {
+	e.mu.Lock()
+	e.events = append(e.events, event)
+	e.mu.Unlock()
+}
+
+// Only the agent holding a dispatch may report it started. Another agent of
+// the same tenant would free a booting runner's job for a second dispatch, and
+// another tenant must not touch it at all.
+func TestStartedScopedToHoldingAgent(t *testing.T) {
+	fe := newFakeEnroll()
+	fe.tokens["tok-a1"] = agentIdentity{orgs: []string{"orgA"}, name: "a1"}
+	fe.tokens["tok-a2"] = agentIdentity{orgs: []string{"orgA"}, name: "a2"}
+	fe.tokens["tok-b"] = agentIdentity{orgs: []string{"orgB"}, name: "b1"}
+	led := memLedger(t)
+	s := NewServer(0, "", led, fe)
+	rec := &eventRecorder{}
+	s.WithTelemetry(rec)
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	holder := NewClient(srv.URL, "tok-a1")
+	o, err := holder.Poll(ctx, "a1", PollRequest{Capacity: 1, Labels: []string{"self-hosted"},
+		Queues: oneJob("orgA", 7, 0, "self-hosted")})
+	if err != nil || o == nil {
+		t.Fatalf("poll: err=%v offer=%v", err, o)
+	}
+	if err := holder.Claim(ctx, "a1", o.ID); err != nil {
+		t.Fatal(err)
+	}
+	state := func() string { return led.Snapshot()[0].State }
+
+	for _, c := range []struct{ tok, name string }{{"tok-a2", "a2"}, {"tok-b", "b1"}} {
+		if err := NewClient(srv.URL, c.tok).ReportStarted(ctx, c.name, o.ID); err != nil {
+			t.Fatalf("%s: a foreign start is a no-op, got %v", c.name, err)
+		}
+		if state() != dispatch.StateClaimed {
+			t.Fatalf("%s started another agent's dispatch", c.name)
+		}
+	}
+	if err := NewClient(srv.URL, "tok-b").ReportStarted(ctx, "a1", o.ID); err == nil {
+		t.Fatal("a token used under another agent's name must be rejected")
+	}
+
+	if err := holder.ReportStarted(ctx, "a1", o.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state() != dispatch.StateStarted {
+		t.Fatal("the holding agent's start was not recorded")
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if n := len(rec.events); n == 0 || rec.events[n-1] != "started" {
+		t.Fatalf("events = %v, want a final started event", rec.events)
+	}
+}
+
+// startFailStore fails every Start, as a database outage would.
+type startFailStore struct{ dispatch.Store }
+
+func (startFailStore) Start(string, string, []string) (dispatch.Record, bool, error) {
+	return dispatch.Record{}, false, fmt.Errorf("boom")
+}
+
+// A start the store did not record must not answer 200, or the agent drops its
+// retry and the offered job stays blocked until the runner finishes.
+func TestStartedStoreErrorAsksForRetry(t *testing.T) {
+	srv := httptest.NewServer(NewServer(0, "", startFailStore{memLedger(t)}, nil).Routes())
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := NewClient(srv.URL, "").ReportStarted(ctx, "a1", "ushr-a1-1"); err == nil {
+		t.Fatal("a failed store write must return an error status")
 	}
 }
 
@@ -584,7 +670,7 @@ func TestSweepLostOnDeadAgent(t *testing.T) {
 	if _, ok, _ := led.Claim("ushr-a-8", base, nil); !ok {
 		t.Fatal("claim")
 	}
-	if _, ok, _ := led.Start("ushr-a-8", nil); !ok {
+	if _, ok, _ := led.Start("ushr-a-8", "a", nil); !ok {
 		t.Fatal("start")
 	}
 	s.heartbeat("a")
