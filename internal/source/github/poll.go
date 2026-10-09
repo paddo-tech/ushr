@@ -36,9 +36,10 @@ func (c orgClient) scope() string {
 }
 
 // Poller polls every configured org's repos for queued workflow runs and emits
-// each queued job as a domain.Job on every listing of its run. A re-emission is
-// what keeps a waiting job in the agent's queue; the agent and the control
-// plane reject a repeat while a dispatch for the job is live.
+// each queued job as a domain.Job on every pass, from a fresh listing or from
+// the run cache. A re-emission is what keeps a waiting job in the agent's
+// queue; the agent and the control plane reject a repeat while a dispatch for
+// the job is live.
 type Poller struct {
 	clients  []orgClient
 	interval time.Duration
@@ -54,12 +55,16 @@ type Poller struct {
 	// jobs while unchanged: unchanged in_progress runs are the dominant
 	// rate-limit cost on a busy repo.
 	seenRuns map[int64]runState
+	// horizon is the start of each scope's last clean pass: one in which every
+	// list call succeeded, so every job it did not emit is no longer queued.
+	horizon map[string]time.Time
 }
 
 // runState records what we knew about a run at its last jobs-listing.
 type runState struct {
-	updated  time.Time // run.updated_at we last processed
-	listedAt time.Time // wall clock of that listing, for the re-list floor
+	updated  time.Time    // run.updated_at we last processed
+	listedAt time.Time    // wall clock of that listing, for the re-list floor
+	queued   []domain.Job // the run's queued jobs at that listing
 }
 
 const (
@@ -76,11 +81,18 @@ const (
 	seenTTL = 24 * time.Hour
 )
 
-// QueueTTL is how long a consumer should keep a job this source has stopped
-// emitting. A still-queued job is re-emitted at least every relist gap
-// (relistPolls polls); three gaps ride out a failed listing or two.
-func QueueTTL(interval time.Duration) time.Duration {
-	return 3 * relistPolls * interval
+// Horizon returns the start of scope's last clean pass, zero before the first.
+// A job this source last emitted before it is no longer queued.
+func (p *Poller) Horizon(scope string) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.horizon[scope]
+}
+
+// RelistGap bounds how stale an emitted job's state can be: a run is re-listed
+// at least this often, and its cached jobs are re-emitted until then.
+func (p *Poller) RelistGap() time.Duration {
+	return relistPolls * p.interval
 }
 
 func newBreakers(clients []orgClient) map[string]*breaker {
@@ -117,6 +129,7 @@ func New(ctx context.Context, auths []AppAuth, interval time.Duration, m *metric
 		breakers: newBreakers(clients),
 		metrics:  m,
 		seenRuns: make(map[int64]runState),
+		horizon:  make(map[string]time.Time),
 	}, nil
 }
 
@@ -129,6 +142,7 @@ func newWithClients(clients []orgClient, interval time.Duration) *Poller {
 		breakers: newBreakers(clients),
 		metrics:  metrics.NewAgent(""),
 		seenRuns: make(map[int64]runState),
+		horizon:  make(map[string]time.Time),
 	}
 }
 
@@ -206,11 +220,13 @@ func (p *Poller) prune(now time.Time) {
 }
 
 // pollOrg polls queued/in_progress workflow runs and emits Jobs for queued
-// jobs. It polls c.Repos when set (an explicit allowlist, which also
+// jobs. A pass with no failed list call advances the scope's horizon. It polls c.Repos when set (an explicit allowlist, which also
 // avoids the list-installation-repos call); otherwise every repo the App
 // installation can access — which doesn't scale past a handful of repos against
 // the API rate limit.
 func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<- domain.Job) error {
+	start := time.Now()
+	clean := true
 	type repoRef struct{ owner, name string }
 	var refs []repoRef
 	switch {
@@ -240,8 +256,10 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 		// `needs:` stay queued until their deps finish. Polling only queued runs
 		// would strand every job after the first in a multi-job workflow.
 		for _, status := range []string{"queued", "in_progress"} {
+			// A run missing from the page would read as gone, so take the
+			// largest page GitHub serves.
 			runs, resp, err := c.Client.Actions.ListRepositoryWorkflowRuns(ctx, ref.owner, ref.name,
-				&github.ListWorkflowRunsOptions{Status: status})
+				&github.ListWorkflowRunsOptions{Status: status, ListOptions: github.ListOptions{PerPage: 100}})
 			p.observe(c, b, err, resp)
 			// Stop the org's tick the moment the breaker trips — whether from
 			// this error (every remaining repo would fail the same way) or a
@@ -255,6 +273,7 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 			}
 			if err != nil {
 				slog.Warn("list runs failed", "repo", ref.owner+"/"+ref.name, "status", status, "err", err)
+				clean = false
 				continue
 			}
 			now := time.Now()
@@ -271,46 +290,53 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 				p.mu.Lock()
 				st, ok := p.seenRuns[run.GetID()]
 				p.mu.Unlock()
-				if ok && st.updated.Equal(updated) && now.Sub(st.listedAt) < relistPolls*p.interval {
-					continue
-				}
-				if p.emitRunJobs(ctx, out, c, b, ref.owner, ref.name, run) {
+				if !ok || !st.updated.Equal(updated) || now.Sub(st.listedAt) >= relistPolls*p.interval {
+					jobs, listed := p.listRunJobs(ctx, c, b, ref.owner, ref.name, run)
+					if !listed {
+						clean = false
+						continue
+					}
+					st = runState{updated: updated, listedAt: time.Now(), queued: jobs}
 					p.mu.Lock()
-					p.seenRuns[run.GetID()] = runState{updated: updated, listedAt: time.Now()}
+					p.seenRuns[run.GetID()] = st
 					p.mu.Unlock()
 				}
+				p.emit(ctx, out, st.queued)
 			}
 		}
+	}
+	if clean && ctx.Err() == nil {
+		p.mu.Lock()
+		p.horizon[c.scope()] = start
+		p.mu.Unlock()
 	}
 	return nil
 }
 
-// emitRunJobs fetches a run's jobs and emits one domain.Job per queued job,
+// listRunJobs fetches a run's jobs and returns one domain.Job per queued job,
 // carrying that job's runs-on labels. Per-job (not per-run)
 // granularity is required for two reasons: a runner is ephemeral and serves
 // exactly one job, so a multi-job run needs one runner each; and label routing
 // needs each job's own labels, which only the jobs API exposes.
 //
-// It returns true once the run's jobs were successfully listed (so the caller
-// can cache its updated_at); false on a list error, leaving the run uncached so
-// the next poll retries it.
-func (p *Poller) emitRunJobs(ctx context.Context, out chan<- domain.Job, c orgClient, b *breaker, owner, repo string, run *github.WorkflowRun) bool {
+// ok is false on a list error, leaving the run uncached so the next poll
+// retries it.
+func (p *Poller) listRunJobs(ctx context.Context, c orgClient, b *breaker, owner, repo string, run *github.WorkflowRun) ([]domain.Job, bool) {
 	jobs, resp, err := c.Client.Actions.ListWorkflowJobs(ctx, owner, repo, run.GetID(),
-		&github.ListWorkflowJobsOptions{Filter: "latest"})
+		&github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}})
 	// This per-run call is the dominant rate-limit cost on a busy repo, so feed
 	// its outcome to the breaker too — otherwise an abuse/rate trip here would
 	// never pause the org.
 	p.observe(c, b, err, resp)
 	if err != nil {
 		slog.Warn("list jobs failed", "repo", owner+"/"+repo, "run", run.GetID(), "err", err)
-		return false
+		return nil, false
 	}
-	p.emit(ctx, out, queuedJobs(c.scope(), repo, run, jobs.Jobs))
-	return true
+	return queuedJobs(c.scope(), repo, run, jobs.Jobs), true
 }
 
-// emit sends each job to out. Every listing re-sends a still-queued job, even
-// one a runner was minted for: GitHub may have given that runner another job.
+// emit sends each job to out. Every pass re-sends a still-queued job, even one
+// a runner was minted for: GitHub may have given that runner another job.
 // A cancelled ctx aborts the send rather than blocking on an unread channel.
 func (p *Poller) emit(ctx context.Context, out chan<- domain.Job, jobs []domain.Job) {
 	for _, job := range jobs {

@@ -36,6 +36,17 @@ type DispatchObserver interface {
 	DispatchDone(handle string, failed bool)
 }
 
+// Freshness is implemented by a source that re-emits every job still queued
+// on each clean pass (the GitHub poller). Without it the agent can only age
+// jobs out by queueTTL.
+type Freshness interface {
+	// Horizon is the start of scope's last clean pass, zero before the first.
+	// A job last emitted before it is no longer queued.
+	Horizon(scope string) time.Time
+	// RelistGap bounds how stale an emitted job's state can be.
+	RelistGap() time.Duration
+}
+
 // ActionCache keeps the host's action archive cache. Fill must not block: it
 // runs on the dispatch path.
 type ActionCache interface {
@@ -73,9 +84,10 @@ var drainWait = 20 * time.Minute
 // is collected on its own schedule rather than only under pressure.
 var reconcileInterval = 10 * time.Minute
 
-// defaultQueueTTL is the queue TTL for a source that emits each job once and
-// never re-reports it (scale sets), so silence there does not mean gone.
-const defaultQueueTTL = 26 * time.Hour
+// queueTTL bounds how long a pending job stays queued when the source cannot
+// say it is gone (no Freshness). A scale set emits each job once and never
+// re-reports it, so silence there does not mean gone.
+const queueTTL = 26 * time.Hour
 
 // unblockDwell is how many consecutive clear samples end a block. One sample at
 // the boundary would flap: unblock, take a job, re-block, hand it back.
@@ -126,14 +138,10 @@ type Agent struct {
 	// under disk pressure.
 	Actions ActionCache
 
-	// QueueTTL evicts a pending job the source has stopped re-reporting: one
-	// that was cancelled, or that a runner (any runner) took. GitHub never says
-	// a job left the queue, so silence is the only signal there is. It must
-	// exceed the source's worst-case re-report period, or a job still waiting
-	// drops out of the report until the next re-report. Until it expires, a
-	// gone job can still be offered and mint a runner that idles to the
-	// startup-grace reap.
-	QueueTTL time.Duration
+	// Source, when set, says when a pending job has left GitHub's queue: it
+	// was not re-emitted by a clean pass of its scope. A paused or failing
+	// scope evicts nothing, so a job still waiting is never dropped.
+	Source Freshness
 
 	minter      Minter
 	orgPriority map[string]int
@@ -153,6 +161,8 @@ type Agent struct {
 	unsent     map[string]api.DoneRequest // done-reports that failed to send, latest per handle
 	queue      map[int64]queued           // known-pending jobs, reported to the control plane
 	dispatched map[int64]bool             // jobs claimed but not yet started, excluded from the report
+	tombstone  map[int64]time.Time        // jobs forgotten at runner start, ignored until the time given
+	unstarted  map[string]struct{}        // started-reports that failed to send, by handle
 	wg         sync.WaitGroup             // tracks in-flight handleOffer goroutines
 }
 
@@ -174,7 +184,6 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		Driver:      drv,
 		Client:      client,
 		Metrics:     metrics.NewAgent(""),
-		QueueTTL:    defaultQueueTTL,
 		minter:      minter,
 		orgPriority: orgPriority,
 		jobs:        jobs,
@@ -183,6 +192,8 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		unsent:      make(map[string]api.DoneRequest),
 		queue:       make(map[int64]queued),
 		dispatched:  make(map[int64]bool),
+		tombstone:   make(map[int64]time.Time),
+		unstarted:   make(map[string]struct{}),
 	}
 }
 
@@ -373,6 +384,13 @@ func (a *Agent) drainJobs(ctx context.Context) {
 				continue
 			}
 			a.mu.Lock()
+			if until, ok := a.tombstone[j.JobID]; ok {
+				if time.Now().Before(until) {
+					a.mu.Unlock()
+					continue
+				}
+				delete(a.tombstone, j.JobID)
+			}
 			_, known := a.queue[j.JobID]
 			a.queue[j.JobID] = queued{job: j, seen: time.Now()}
 			a.mu.Unlock()
@@ -717,13 +735,11 @@ func (a *Agent) handleDispatch(ctx context.Context, o *api.Offer) {
 	started := false
 	a.waitForDone(ctx, handle, func() {
 		started = true
-		a.forget(o.JobID)
+		a.forgetStarted(o.JobID)
 		slog.Info("runner took a job", "id", o.ID, "offered_job", o.JobID)
 		rc, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportBudget)
 		defer cancel()
-		if err := a.Client.ReportStarted(rc, a.Name, o.ID); err != nil {
-			slog.Warn("report started failed", "id", o.ID, "err", err)
-		}
+		a.reportStarted(rc, o.ID)
 	})
 
 	destroyCtx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), destroyBudget)
@@ -804,12 +820,28 @@ func (a *Agent) startedJob(ctx context.Context, w driver.JobWatcher, h driver.Sl
 	return started
 }
 
+// reportStarted tells the control plane the runner took a job. Until it lands
+// the offered job stays blocked there, so a failure is buffered and retried
+// with the done-reports.
+func (a *Agent) reportStarted(ctx context.Context, handle string) {
+	if err := a.Client.ReportStarted(ctx, a.Name, handle); err != nil {
+		slog.Warn("report started failed, buffering for retry", "handle", handle, "err", err)
+		a.mu.Lock()
+		a.unstarted[handle] = struct{}{}
+		a.mu.Unlock()
+	}
+}
+
 // report sends a terminal dispatch report. On failure the report is buffered
 // and retried at the top of every poll iteration — a control plane that was
 // down at completion time otherwise never learns the slot freed. The local
 // source's ledger is notified here regardless of delivery: the runner is
 // terminal either way, and only the control plane needs the retry.
 func (a *Agent) report(ctx context.Context, handle string, req api.DoneRequest) {
+	// The done-report resolves the dispatch, so a pending started-report is moot.
+	a.mu.Lock()
+	delete(a.unstarted, handle)
+	a.mu.Unlock()
 	if obs, ok := a.minter.(DispatchObserver); ok {
 		obs.DispatchDone(handle, req.Status != "done")
 	}
@@ -830,16 +862,33 @@ func (a *Agent) reportBudgeted(ctx context.Context, handle string, req api.DoneR
 	a.report(rc, handle, req)
 }
 
-// flushReports retries buffered done-reports. Reports are idempotent
-// server-side (an unknown handle resolves to a no-op), so a duplicate send
-// after an ambiguous failure is safe.
+// flushReports retries buffered started- and done-reports. Reports are
+// idempotent server-side (an unknown or already started handle is a no-op), so
+// a duplicate send after an ambiguous failure is safe.
 func (a *Agent) flushReports(ctx context.Context) {
 	a.mu.Lock()
 	queued := make(map[string]api.DoneRequest, len(a.unsent))
 	for h, r := range a.unsent {
 		queued[h] = r
 	}
+	starts := make([]string, 0, len(a.unstarted))
+	for h := range a.unstarted {
+		starts = append(starts, h)
+	}
 	a.mu.Unlock()
+	for _, h := range starts {
+		callCtx, cancel := context.WithTimeout(ctx, reportBudget)
+		err := a.Client.ReportStarted(callCtx, a.Name, h)
+		cancel()
+		if err != nil {
+			slog.Warn("started report retry failed", "handle", h, "err", err)
+			continue
+		}
+		slog.Info("buffered started report delivered", "handle", h)
+		a.mu.Lock()
+		delete(a.unstarted, h)
+		a.mu.Unlock()
+	}
 	for h, r := range queued {
 		callCtx, cancel := context.WithTimeout(ctx, reportBudget)
 		err := a.Client.ReportDone(callCtx, a.Name, h, r)
@@ -866,7 +915,7 @@ func (a *Agent) reportQueues() []api.OrgQueue {
 		if a.dispatched[id] {
 			continue // claimed: its runner is booting
 		}
-		if now.Sub(q.seen) > a.QueueTTL {
+		if a.gone(q, now) {
 			delete(a.queue, id)
 			continue
 		}
@@ -875,6 +924,11 @@ func (a *Agent) reportQueues() []api.OrgQueue {
 			Labels:      q.job.Labels,
 			WaitingSecs: int(now.Sub(q.job.QueuedAt).Seconds()),
 		})
+	}
+	for id, until := range a.tombstone {
+		if now.After(until) {
+			delete(a.tombstone, id)
+		}
 	}
 	out := make([]api.OrgQueue, 0, len(byOrg))
 	for org, jobs := range byOrg {
@@ -893,6 +947,28 @@ func (a *Agent) markDispatched(jobID int64) {
 func (a *Agent) undispatch(jobID int64) {
 	a.mu.Lock()
 	delete(a.dispatched, jobID)
+	a.mu.Unlock()
+}
+
+// gone reports whether a pending job has left GitHub's queue: missing from a
+// clean pass of its scope, or past queueTTL when the source cannot say.
+func (a *Agent) gone(q queued, now time.Time) bool {
+	if a.Source != nil {
+		return q.seen.Before(a.Source.Horizon(q.job.Org))
+	}
+	return now.Sub(q.seen) > queueTTL
+}
+
+// forgetStarted forgets a job whose runner took a job. The source can still
+// hold a listing taken before the job left the queue, so re-emissions are
+// ignored for one relist gap: long enough for the source to see the change.
+func (a *Agent) forgetStarted(jobID int64) {
+	a.forget(jobID)
+	if a.Source == nil {
+		return
+	}
+	a.mu.Lock()
+	a.tombstone[jobID] = time.Now().Add(a.Source.RelistGap())
 	a.mu.Unlock()
 }
 

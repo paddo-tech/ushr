@@ -89,13 +89,14 @@ func run(configPath string) error {
 		}
 	}
 
-	jobs, minter, prio, err := newSource(ctx, cfg, m)
+	jobs, minter, prio, fresh, err := newSource(ctx, cfg, m)
 	if err != nil {
 		return err
 	}
 
 	client := api.NewClient(cfg.ControllerURL, cfg.Token)
 	a := agent.New(cfg.Name, cfg.Labels, drv, client, minter, prio, jobs)
+	a.Source = fresh
 	a.Metrics = m
 	a.Version = version.Version
 	a.Update = update.Prepare
@@ -103,11 +104,6 @@ func run(configPath string) error {
 	a.FailedVersion, a.FailedRequest, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
-	// Only the poll source re-reports a waiting job; scale-set jobs are emitted
-	// once and keep the default TTL.
-	if _, ok := minter.(*jit.Minter); ok {
-		a.QueueTTL = gh.QueueTTL(cfg.Source.Interval)
-	}
 	// Scale-set jobs carry no repo or GitHub job id, so only the poll source fills.
 	if m, ok := minter.(*jit.Minter); ok {
 		if c, err := actioncache.New(factory.ActionCacheDir(cfg.Driver), m.Client); err != nil {
@@ -130,13 +126,13 @@ func run(configPath string) error {
 // config. Model B: the agent — not the control plane — holds the App keys,
 // watches GitHub (poll or scale-set message sessions), and mints. An unset
 // type defaults to poll.
-func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan domain.Job, agent.Minter, map[string]int, error) {
+func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
 	switch cfg.Source.Type {
 	case config.SourceTypePoll, "":
 	case config.SourceTypeScaleSet:
 		return newScaleSetSource(ctx, cfg)
 	default:
-		return nil, nil, nil, fmt.Errorf("unsupported source type %q", cfg.Source.Type)
+		return nil, nil, nil, nil, fmt.Errorf("unsupported source type %q", cfg.Source.Type)
 	}
 	auths := make([]gh.AppAuth, 0, len(cfg.Orgs)+len(cfg.Repos))
 	minter := jit.New()
@@ -146,7 +142,7 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 		auths = append(auths, auth)
 		prio[o.Name] = o.Priority
 		if err := minter.Add(ctx, auth, o.RunnerGroupID); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	// Repo targets (personal-account / per-repo). No runner group — repo runners
@@ -156,15 +152,15 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 		auths = append(auths, auth)
 		prio[r.Scope()] = r.Priority
 		if err := minter.Add(ctx, auth, 0); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	source, err := gh.New(ctx, auths, cfg.Source.Interval, m)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	jobs, err := source.Subscribe(ctx)
-	return jobs, minter, prio, err
+	return jobs, minter, prio, source, err
 }
 
 // newScaleSetSource wires the Runner Scale Set source agent-side: GitHub
@@ -172,20 +168,20 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 // missing runner, and it mints the runner into the owning set at dispatch —
 // the same Source the standalone controller uses, with the agent's terminal
 // reports feeding its supply ledger (see agent.DispatchObserver).
-func newScaleSetSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Job, agent.Minter, map[string]int, error) {
+func newScaleSetSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
 	if len(cfg.Repos) > 0 {
-		return nil, nil, nil, fmt.Errorf("repo targets aren't supported with the scaleset source (scale sets are org-level)")
+		return nil, nil, nil, nil, fmt.Errorf("repo targets aren't supported with the scaleset source (scale sets are org-level)")
 	}
 	src, err := scaleset.New(cfg.Orgs, version.Version)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	prio := make(map[string]int, len(cfg.Orgs))
 	for _, o := range cfg.Orgs {
 		prio[o.Name] = o.Priority
 	}
 	jobs, err := src.Subscribe(ctx)
-	return jobs, src, prio, err
+	return jobs, src, prio, nil, err
 }
 
 // serveMetrics binds before returning so a bad address fails startup loudly,
