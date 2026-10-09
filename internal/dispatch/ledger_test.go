@@ -120,7 +120,7 @@ func TestStartReleasesOfferedJob(t *testing.T) {
 	if err := l.Offer(rec("ushr-a-1", "mac1", 42)); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := l.Start("ushr-a-1", nil); ok {
+	if _, ok, _ := l.Start("ushr-a-1", "mac1", nil); ok {
 		t.Fatal("an offered record must not start before it is claimed")
 	}
 	if _, ok, _ := l.Claim("ushr-a-1", time.Now(), nil); !ok {
@@ -129,10 +129,14 @@ func TestStartReleasesOfferedJob(t *testing.T) {
 	if err := l.Offer(rec("ushr-a-2", "mac1", 42)); !errors.Is(err, ErrDuplicate) {
 		t.Fatalf("claimed job re-offered: want ErrDuplicate, got %v", err)
 	}
-	if _, ok, _ := l.Start("ushr-a-1", []string{"other"}); ok {
+	if _, ok, _ := l.Start("ushr-a-1", "mac1", []string{"other"}); ok {
 		t.Fatal("another tenant must not start the dispatch")
 	}
-	r, ok, err := l.Start("ushr-a-1", nil)
+	// Another agent of the same tenant would free a booting runner's job.
+	if _, ok, _ := l.Start("ushr-a-1", "mac2", nil); ok {
+		t.Fatal("another agent must not start the dispatch")
+	}
+	r, ok, err := l.Start("ushr-a-1", "mac1", nil)
 	if err != nil || !ok || r.State != StateStarted {
 		t.Fatalf("start: ok=%v err=%v rec=%+v", ok, err, r)
 	}

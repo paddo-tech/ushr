@@ -601,7 +601,9 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStarted releases a dispatch's hold on its offered job once the runner
-// has taken a job. The agent's busy report still counts the slot.
+// has taken a job. The agent's busy report still counts the slot. A store
+// error answers 500 so the agent retries; a repeat after a partial write finds
+// the record started and is a no-op.
 func (s *Server) handleStarted(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	handle := r.PathValue("handle")
@@ -609,9 +611,17 @@ func (s *Server) handleStarted(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.heartbeat(livenessKey(orgs, name))
-	if _, _, err := s.ledger.Start(handle, orgs); err != nil {
-		slog.Warn("ledger start append failed", "id", handle, "err", err)
+	key := livenessKey(orgs, name)
+	s.heartbeat(key)
+	rec, started, err := s.ledger.Start(handle, key, orgs)
+	if err != nil {
+		slog.Warn("ledger start failed", "id", handle, "err", err)
+		http.Error(w, "ledger unavailable", http.StatusInternalServerError)
+		return
+	}
+	if started {
+		s.telemetry.Event(rec.Pending.Org, rec.ID, "started",
+			map[string]any{"agent": rec.Agent, "job_id": rec.Pending.JobID})
 	}
 	w.WriteHeader(http.StatusOK)
 }

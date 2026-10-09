@@ -84,10 +84,13 @@ func TestStartReleasesOfferedJob(t *testing.T) {
 	if _, ok, _ := s.Claim("ushr-a-7", time.Now(), nil); !ok {
 		t.Fatal("claim")
 	}
-	if _, ok, _ := s.Start("ushr-a-7", []string{"other"}); ok {
+	if _, ok, _ := s.Start("ushr-a-7", "agent-1", []string{"other"}); ok {
 		t.Fatal("another tenant must not start the dispatch")
 	}
-	r, ok, err := s.Start("ushr-a-7", []string{"ACME"})
+	if _, ok, _ := s.Start("ushr-a-7", "agent-2", []string{"acme"}); ok {
+		t.Fatal("another agent must not start the dispatch")
+	}
+	r, ok, err := s.Start("ushr-a-7", "agent-1", []string{"ACME"})
 	if err != nil || !ok || r.State != dispatch.StateStarted {
 		t.Fatalf("start: ok=%v err=%v rec=%+v", ok, err, r)
 	}
@@ -99,5 +102,49 @@ func TestStartReleasesOfferedJob(t *testing.T) {
 	}
 	if got := len(s.Snapshot()); got != 2 {
 		t.Fatalf("snapshot: want 2 live, got %d", got)
+	}
+}
+
+// A store first created by an older controller carries the full unique index.
+// Applying the schema must swap it for the partial one, or a started row keeps
+// blocking a new offer of its job.
+func TestSchemaReplacesFullJobIndex(t *testing.T) {
+	s := testStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := s.pool.Exec(ctx, `DROP INDEX dispatches_org_lower_job_id_unstarted;
+		CREATE UNIQUE INDEX dispatches_org_lower_job_id ON dispatches (lower(org), job_id)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewWithPool(ctx, s.pool); err != nil {
+		t.Fatalf("reapply schema: %v", err)
+	}
+	var names []string
+	rows, err := s.pool.Query(ctx, `SELECT indexname FROM pg_indexes WHERE tablename = 'dispatches' AND indexname LIKE 'dispatches_org%' ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if len(names) != 1 || names[0] != "dispatches_org_lower_job_id_unstarted" {
+		t.Fatalf("job indexes = %v, want only the partial index", names)
+	}
+	if err := s.Offer(rec("ushr-a-7", "acme", 7)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Claim("ushr-a-7", time.Now(), nil); !ok {
+		t.Fatal("claim")
+	}
+	if _, ok, _ := s.Start("ushr-a-7", "agent-1", nil); !ok {
+		t.Fatal("start")
+	}
+	if err := s.Offer(rec("ushr-b-7", "acme", 7)); err != nil {
+		t.Fatalf("offer after start on a migrated store: %v", err)
 	}
 }

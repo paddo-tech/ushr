@@ -241,12 +241,12 @@ func (l *Ledger) Claim(id string, at time.Time, wantOrgs []string) (Record, bool
 }
 
 // Start transitions a claimed record to started, returning it. ok is false if
-// the record is unknown, not claimed, or owned by another tenant.
-func (l *Ledger) Start(id string, wantOrgs []string) (Record, bool, error) {
+// the record is unknown, not claimed, or owned by another agent or tenant.
+func (l *Ledger) Start(id, agent string, wantOrgs []string) (Record, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	r, ok := l.live[id]
-	if !ok || r.State != StateClaimed || !orgMatches(wantOrgs, r.Pending.Org) {
+	if !ok || r.State != StateClaimed || r.Agent != agent || !orgMatches(wantOrgs, r.Pending.Org) {
 		return Record{}, false, nil
 	}
 	r.State = StateStarted
