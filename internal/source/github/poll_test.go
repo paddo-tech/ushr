@@ -83,19 +83,11 @@ func TestEmit_RespectsCtxCancel(t *testing.T) {
 func TestPrune_EvictsExpiredEntries(t *testing.T) {
 	p := newWithClients(nil, time.Second)
 	now := time.Now()
-	p.seen[1] = now.Add(-25 * time.Hour) // older than seenTTL
-	p.seen[2] = now.Add(-1 * time.Hour)  // fresh
 	p.seenRuns[10] = runState{listedAt: now.Add(-25 * time.Hour)}
 	p.seenRuns[20] = runState{listedAt: now.Add(-1 * time.Hour)}
 
 	p.prune(now)
 
-	if _, ok := p.seen[1]; ok {
-		t.Error("seen[1] should have been evicted")
-	}
-	if _, ok := p.seen[2]; !ok {
-		t.Error("seen[2] should survive")
-	}
 	if _, ok := p.seenRuns[10]; ok {
 		t.Error("seenRuns[10] should have been evicted")
 	}
@@ -104,55 +96,33 @@ func TestPrune_EvictsExpiredEntries(t *testing.T) {
 	}
 }
 
-func TestEmit_SuppressesDuplicateWithinRedispatchWindow(t *testing.T) {
+// A runner minted for a job can take another one, leaving the first queued.
+// Only a re-emission puts it back in front of the scheduler, so every listing
+// must re-send it, not just the first.
+func TestEmit_ReemitsStillQueuedJobOnEveryListing(t *testing.T) {
 	p := newWithClients(nil, time.Second)
-	out := make(chan domain.Job, 2)
+	out := make(chan domain.Job, 3)
 	job := domain.Job{Org: "o", JobID: 7}
 
-	p.emit(context.Background(), out, []domain.Job{job})
-	<-out // first sighting sends and records seen
-
-	// Still queued inside the window: a repeat is filtered downstream while
-	// the dispatch is live, so suppressing it here only saves churn.
-	p.emit(context.Background(), out, []domain.Job{job})
-
-	if len(out) != 0 {
-		t.Fatal("re-emitted inside the redispatch window")
+	for range 3 {
+		p.emit(context.Background(), out, []domain.Job{job})
+	}
+	if len(out) != 3 {
+		t.Fatalf("emitted %d times over 3 listings, want 3", len(out))
 	}
 }
 
-func TestEmit_RedispatchesJobStillQueuedAfterWindow(t *testing.T) {
-	p := newWithClients(nil, time.Second)
-	out := make(chan domain.Job, 2)
-	job := domain.Job{Org: "o", JobID: 7}
-
-	p.emit(context.Background(), out, []domain.Job{job})
-	<-out
-
-	// A job still queued past the window must be offered again — nothing else
-	// will provision for it.
-	p.mu.Lock()
-	p.seen[7] = time.Now().Add(-redispatchAfter - time.Minute)
-	p.mu.Unlock()
-
-	p.emit(context.Background(), out, []domain.Job{job})
-
-	select {
-	case got := <-out:
-		if got.JobID != 7 {
-			t.Fatalf("re-emitted the wrong job: %d", got.JobID)
+// The consumer's TTL must outlast the longest gap between re-emissions of a
+// waiting job (an unchanged run is re-listed every relistPolls polls), or the
+// job drops out of the report while it still waits.
+func TestQueueTTL_OutlastsRelistGap(t *testing.T) {
+	for _, interval := range []time.Duration{10 * time.Second, 30 * time.Second, time.Minute} {
+		gap := relistPolls * interval
+		if ttl := QueueTTL(interval); ttl < 2*gap {
+			t.Errorf("interval %s: TTL %s does not cover two relist gaps of %s", interval, ttl, gap)
 		}
-	default:
-		t.Fatal("still-queued job was never re-emitted — it would wait forever")
 	}
-
-	// The re-emission also refreshes seen, so prune cannot evict a job that is
-	// still waiting.
-	p.prune(time.Now())
-	p.mu.Lock()
-	_, ok := p.seen[7]
-	p.mu.Unlock()
-	if !ok {
-		t.Fatal("seen entry evicted immediately after re-emission")
+	if got := QueueTTL(30 * time.Second); got > 10*time.Minute {
+		t.Errorf("TTL at a 30s interval = %s, want a few minutes so a gone job ages out quickly", got)
 	}
 }

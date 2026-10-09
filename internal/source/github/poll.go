@@ -36,8 +36,9 @@ func (c orgClient) scope() string {
 }
 
 // Poller polls every configured org's repos for queued workflow runs and emits
-// each queued job as a domain.Job, deduped by job ID across polls; a job still
-// queued past redispatchAfter is re-emitted.
+// each queued job as a domain.Job on every listing of its run. A re-emission is
+// what keeps a waiting job in the agent's queue; the agent and the control
+// plane reject a repeat while a dispatch for the job is live.
 type Poller struct {
 	clients  []orgClient
 	interval time.Duration
@@ -49,11 +50,9 @@ type Poller struct {
 	metrics *metrics.Agent
 
 	mu sync.Mutex
-	// seen dedups emitted jobs by job ID (value = when last emitted, for the
-	// redispatch window and TTL eviction). seenRuns caches each run's last list
-	// state so we can skip re-listing its jobs while unchanged — unchanged
-	// in_progress runs are the dominant rate-limit cost on a busy repo.
-	seen     map[int64]time.Time
+	// seenRuns caches each run's last list state so we can skip re-listing its
+	// jobs while unchanged: unchanged in_progress runs are the dominant
+	// rate-limit cost on a busy repo.
 	seenRuns map[int64]runState
 }
 
@@ -72,21 +71,17 @@ const (
 	// polls rather than never. With ETag the forced re-list is a free 304 when
 	// genuinely unchanged.
 	relistPolls = 6
-	// seenTTL evicts dedup entries this long after they were last emitted,
+	// seenTTL evicts run cache entries this long after they were last listed,
 	// bounding map growth on a long-lived poller.
 	seenTTL = 24 * time.Hour
-	// redispatchAfter re-emits a job still queued this long after its last
-	// emission. A JIT runner is not bound to the job it was minted for: any
-	// queued job with matching labels can claim it, and nothing else will
-	// provision for the sibling left waiting. This is a retry interval, not a
-	// duplicate guard — the ledger and the dispatch filter reject a repeat
-	// while a dispatch is live at any value. The window damps a stale listing
-	// landing just after a dispatch resolves, which would mint a runner that
-	// idles until the agent's startup-grace reap (2 minutes) collects it.
-	// Effective cadence is max(redispatchAfter, relistPolls*interval): an
-	// unchanged run is not re-listed more often than that.
-	redispatchAfter = 5 * time.Minute
 )
+
+// QueueTTL is how long a consumer should keep a job this source has stopped
+// emitting. A still-queued job is re-emitted at least every relist gap
+// (relistPolls polls); three gaps ride out a failed listing or two.
+func QueueTTL(interval time.Duration) time.Duration {
+	return 3 * relistPolls * interval
+}
 
 func newBreakers(clients []orgClient) map[string]*breaker {
 	b := make(map[string]*breaker, len(clients))
@@ -121,7 +116,6 @@ func New(ctx context.Context, auths []AppAuth, interval time.Duration, m *metric
 		interval: interval,
 		breakers: newBreakers(clients),
 		metrics:  m,
-		seen:     make(map[int64]time.Time),
 		seenRuns: make(map[int64]runState),
 	}, nil
 }
@@ -134,7 +128,6 @@ func newWithClients(clients []orgClient, interval time.Duration) *Poller {
 		interval: interval,
 		breakers: newBreakers(clients),
 		metrics:  metrics.NewAgent(""),
-		seen:     make(map[int64]time.Time),
 		seenRuns: make(map[int64]runState),
 	}
 }
@@ -194,14 +187,10 @@ func (p *Poller) observe(c orgClient, b *breaker, err error, resp *github.Respon
 	}
 }
 
-// prune evicts dedup entries older than the TTL, bounding map growth on a
-// long-lived poller. Runs once per tick; cheap relative to the API calls.
-//
-// The TTL must exceed the worst-case refresh gap — a still-queued job refreshes
-// seen only when re-emitted, at most redispatchAfter plus the relist gap apart —
-// so floor it above that gap (with margin) rather than trusting the fixed
-// seenTTL at large intervals. Early eviction only costs a premature re-emission
-// (absorbed downstream), but there is no reason to pay it.
+// prune evicts run cache entries older than the TTL, bounding map growth on a
+// long-lived poller. Runs once per tick; cheap relative to the API calls. The
+// TTL is floored above the relist gap: evicting a live run early only costs one
+// extra jobs listing, but there is no reason to pay it.
 func (p *Poller) prune(now time.Time) {
 	ttl := seenTTL
 	if gap := 2 * relistPolls * p.interval; gap > ttl {
@@ -209,11 +198,6 @@ func (p *Poller) prune(now time.Time) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for id, t := range p.seen {
-		if now.Sub(t) > ttl {
-			delete(p.seen, id)
-		}
-	}
 	for id, st := range p.seenRuns {
 		if now.Sub(st.listedAt) > ttl {
 			delete(p.seenRuns, id)
@@ -222,7 +206,7 @@ func (p *Poller) prune(now time.Time) {
 }
 
 // pollOrg polls queued/in_progress workflow runs and emits Jobs for queued
-// jobs (dedup and redispatch handled by emit). It polls c.Repos when set (an explicit allowlist, which also
+// jobs. It polls c.Repos when set (an explicit allowlist, which also
 // avoids the list-installation-repos call); otherwise every repo the App
 // installation can access — which doesn't scale past a handful of repos against
 // the API rate limit.
@@ -301,8 +285,8 @@ func (p *Poller) pollOrg(ctx context.Context, c orgClient, b *breaker, out chan<
 	return nil
 }
 
-// emitRunJobs fetches a run's jobs and emits one domain.Job per queued job not
-// suppressed by emit's dedup, carrying that job's runs-on labels. Per-job (not per-run)
+// emitRunJobs fetches a run's jobs and emits one domain.Job per queued job,
+// carrying that job's runs-on labels. Per-job (not per-run)
 // granularity is required for two reasons: a runner is ephemeral and serves
 // exactly one job, so a multi-job run needs one runner each; and label routing
 // needs each job's own labels, which only the jobs API exposes.
@@ -325,30 +309,15 @@ func (p *Poller) emitRunJobs(ctx context.Context, out chan<- domain.Job, c orgCl
 	return true
 }
 
-// emit sends each job to out, deduping by job ID across polls. A job still
-// queued redispatchAfter since its last emission is sent again, on the grounds
-// that whatever was provisioned for it did not serve it. A cancelled ctx aborts
-// the send rather than blocking on an unread channel.
+// emit sends each job to out. Every listing re-sends a still-queued job, even
+// one a runner was minted for: GitHub may have given that runner another job.
+// A cancelled ctx aborts the send rather than blocking on an unread channel.
 func (p *Poller) emit(ctx context.Context, out chan<- domain.Job, jobs []domain.Job) {
 	for _, job := range jobs {
-		p.mu.Lock()
-		last, dup := p.seen[job.JobID]
-		if dup && time.Since(last) < redispatchAfter {
-			p.mu.Unlock()
-			continue
-		}
-		p.mu.Unlock()
-
 		select {
 		case <-ctx.Done():
 			return
 		case out <- job:
-			// Record seen only after a successful send: a ctx-cancel mid-send
-			// must leave the job unseen so the next poll re-emits it rather than
-			// losing it forever.
-			p.mu.Lock()
-			p.seen[job.JobID] = time.Now()
-			p.mu.Unlock()
 		}
 	}
 }
