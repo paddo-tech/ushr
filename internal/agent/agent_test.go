@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -107,7 +108,7 @@ func TestWaitForDone_ReapsStrandedRunner(t *testing.T) {
 	a := New("test", nil, &stuckDriver{started: false}, nil, nil, nil, nil)
 
 	done := make(chan struct{})
-	go func() { a.waitForDone(context.Background(), "h"); close(done) }()
+	go func() { a.waitForDone(context.Background(), "h", func() {}); close(done) }()
 
 	select {
 	case <-done:
@@ -123,7 +124,7 @@ func TestWaitForDone_DoesNotReapWorkingRunner(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { a.waitForDone(ctx, "h"); close(done) }()
+	go func() { a.waitForDone(ctx, "h", func() {}); close(done) }()
 
 	select {
 	case <-done:
@@ -183,6 +184,87 @@ func TestRunHappyPath(t *testing.T) {
 	}
 	if got := testutil.CollectAndCount(a.Metrics.Registry, "ushr_agent_provision_duration_seconds"); got != 1 {
 		t.Errorf("provision duration series = %d, want 1", got)
+	}
+}
+
+// swapDriver runs two slots whose runners stay up; started flips every runner
+// to "on a job" at once.
+type swapDriver struct {
+	started atomic.Bool
+	n       atomic.Int64
+}
+
+func (d *swapDriver) Capacity() int { return 2 }
+func (d *swapDriver) Provision(context.Context, driver.ProvisionRequest) (driver.SlotHandle, error) {
+	return driver.SlotHandle(fmt.Sprintf("h%d", d.n.Add(1))), nil
+}
+func (d *swapDriver) Status(context.Context, driver.SlotHandle) (driver.Status, error) {
+	return driver.StatusRunning, nil
+}
+func (d *swapDriver) Destroy(context.Context, driver.SlotHandle) error  { return nil }
+func (d *swapDriver) List(context.Context) ([]driver.SlotHandle, error) { return nil, nil }
+func (d *swapDriver) StartedJob(context.Context, driver.SlotHandle) (bool, error) {
+	return d.started.Load(), nil
+}
+
+// GitHub gave the runner minted for job 1 a different job, so job 1 is still
+// queued. The source re-reports it; once the runner has started, job 1 must be
+// dispatched again while the first runner keeps its slot. Before the start, a
+// re-report must not double-dispatch it, and a full host must take nothing more.
+func TestSwappedJobIsRedispatched(t *testing.T) {
+	si, sg := statusInterval, startupGrace
+	t.Cleanup(func() { statusInterval, startupGrace = si, sg })
+	statusInterval, startupGrace = 5*time.Millisecond, time.Minute
+
+	led, err := dispatch.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(api.NewServer(0, "", led, nil).Routes())
+	defer srv.Close()
+
+	labels := []string{"self-hosted"}
+	jobs := make(chan domain.Job)
+	drv := &swapDriver{}
+	a := New("t1", labels, drv, api.NewClient(srv.URL, ""), e2eMinter{}, map[string]int{"acme": 0}, jobs)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = a.Run(ctx); close(runDone) }()
+	defer func() { cancel(); <-runDone }()
+
+	report := func(id int64) { jobs <- domain.Job{Org: "acme", JobID: id, Labels: labels} }
+	dispatches := func(id int64) (n, started int) {
+		for _, r := range led.Snapshot() {
+			if r.Pending.JobID == id {
+				n++
+				if r.State == dispatch.StateStarted {
+					started++
+				}
+			}
+		}
+		return n, started
+	}
+
+	report(1)
+	waitFor(t, "job 1 claimed", func() bool { n, _ := dispatches(1); return n == 1 && len(a.busyHandles()) == 1 })
+	report(1)
+	time.Sleep(50 * time.Millisecond)
+	if n, _ := dispatches(1); n != 1 {
+		t.Fatalf("job 1 dispatched %d times while its runner was booting, want 1", n)
+	}
+
+	drv.started.Store(true)
+	waitFor(t, "first runner started", func() bool { _, s := dispatches(1); return s == 1 })
+	report(1)
+	waitFor(t, "job 1 re-dispatched", func() bool { n, _ := dispatches(1); return n == 2 })
+	if got := len(a.busyHandles()); got != 2 {
+		t.Fatalf("busy slots = %d, want 2: the swapped runner must still count", got)
+	}
+
+	report(2)
+	time.Sleep(50 * time.Millisecond)
+	if n, _ := dispatches(2); n != 0 {
+		t.Fatal("a full host was dispatched more work")
 	}
 }
 
@@ -279,18 +361,20 @@ func TestDrainJobsDropsUnservableWork(t *testing.T) {
 	}
 }
 
-// A job the source has stopped reporting is gone — cancelled, or run by another
-// host. GitHub never says so, so silence past the TTL is the only signal.
+// A job the source has stopped reporting is gone: cancelled, or taken by a
+// runner. GitHub never says so, so silence past the TTL is the only signal, and
+// a short TTL keeps a gone job from minting runners for long.
 func TestReportQueuesEvictsStaleEntries(t *testing.T) {
 	a := New("t1", nil, &stuckDriver{}, nil, nil, nil, nil)
+	a.QueueTTL = 9 * time.Minute
 	a.mu.Lock()
 	a.queue[1] = queued{
 		job:  domain.Job{Org: "acme", JobID: 1, Labels: []string{"self-hosted"}},
-		seen: time.Now().Add(-2 * queueTTL),
+		seen: time.Now().Add(-10 * time.Minute),
 	}
 	a.queue[2] = queued{
 		job:  domain.Job{Org: "acme", JobID: 2, Labels: []string{"self-hosted"}},
-		seen: time.Now(),
+		seen: time.Now().Add(-8 * time.Minute),
 	}
 	a.mu.Unlock()
 

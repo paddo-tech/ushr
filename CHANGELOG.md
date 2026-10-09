@@ -8,6 +8,13 @@ The history in this repository starts at v0.2.4.
 - Releases sign `checksums.txt` with keyless cosign and publish an SBOM for
   each archive.
 - The installer verifies the cosign signature when cosign is installed.
+- fix: re-offer a job when GitHub gives its runner a different job.
+  GitHub assigns a JIT runner to any queued job with matching labels. The
+  job the runner was minted for then stayed queued with no runner. The agent
+  now reports when its runner takes a job, and the control plane frees the
+  offered job for a new offer. The poller re-reports a queued job on every
+  listing, and the agent drops a job it has not seen for three relist gaps.
+  Upgrade the control plane before the agents.
 
 ## v0.2.10 — 2026-09-29
 
