@@ -7,10 +7,10 @@ and never holds a GitHub key. Always-on in `iad`, Neon-backed dispatch store.
 
 ```bash
 fly auth login
-fly apps create ushr-cp                      # or edit `app` in fly.toml
+fly apps create ushr-cp2                      # or edit `app` in fly.toml
 
 # Secrets (not baked into the image):
-fly secrets set USHR_DISPATCH_DSN="postgres://…neon…/ushr?sslmode=require" -a ushr-cp
+fly secrets set USHR_DISPATCH_DSN="postgres://…neon…/ushr?sslmode=require" -a ushr-cp2
 ```
 
 The Neon DSN enables per-agent **enrollment**, which satisfies the non-loopback
@@ -25,7 +25,7 @@ authenticate by running `ushr login`, not a shared token.
 fly deploy -c deploy/fly/fly.toml --dockerfile deploy/fly/Dockerfile
 ```
 
-Health: `https://ushr-cp.fly.dev/healthz` → 200. Point DNS `cp.ushr.io` at the
+Health: `https://ushr-cp2.fly.dev/healthz` → 200. Point DNS `cp.ushr.io` at the
 app (`fly certs add cp.ushr.io`).
 
 ## Roll back past the `started` dispatch state
@@ -41,8 +41,8 @@ older controller's start.
    `auto_start_machines` restarts a stopped machine on the next agent poll.
 
    ```bash
-   fly scale count 0 -a ushr-cp
-   fly machine list -a ushr-cp      # must list no started machine
+   fly scale count 0 -a ushr-cp2
+   fly machine list -a ushr-cp2      # must list no started machine
    ```
 
 2. Run the cleanup against the Neon database:
@@ -61,8 +61,8 @@ older controller's start.
 
 3. Check out the older release tag and deploy it with the command under
    Deploy. Keep the app at zero machines until this deploy starts one.
-4. Scale back to one machine if the deploy did not start one
-   (`fly scale count 1 -a ushr-cp`), and check `/healthz`.
+4. Scale back to the machine count from before step 1 (two in production,
+   `fly scale count 2 -a ushr-cp2`), and check `/healthz`.
 
 Agents keep their dispatches while the control plane is down. They retry their
 reports and resume polling when it returns.
