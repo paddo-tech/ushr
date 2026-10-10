@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/paddo-tech/ushr/internal/domain"
 )
 
 const (
@@ -37,6 +39,21 @@ func TestParse(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Parse = %+v, want %+v", got, want)
+	}
+}
+
+func TestJobRepo(t *testing.T) {
+	for _, tc := range []struct {
+		job         domain.Job
+		owner, repo string
+	}{
+		{domain.Job{Org: "paddo-tech", Repo: "ushr"}, "paddo-tech", "ushr"},
+		{domain.Job{Org: "paddo/blog", Repo: "blog"}, "paddo", "blog"},
+		{domain.Job{Org: "paddo-tech", Repo: "paddo-tech/ushr"}, "paddo-tech", "ushr"},
+	} {
+		if o, r := jobRepo(tc.job); o != tc.owner || r != tc.repo {
+			t.Errorf("jobRepo(%+v) = %s/%s, want %s/%s", tc.job, o, r, tc.owner, tc.repo)
+		}
 	}
 }
 

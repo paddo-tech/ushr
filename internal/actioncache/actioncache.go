@@ -143,7 +143,7 @@ func (c *Cache) Run(ctx context.Context) {
 		case job := <-c.queue:
 			fctx, cancel := context.WithTimeout(ctx, fillTimeout)
 			if err := c.fill(fctx, job); err != nil {
-				slog.Debug("action cache fill failed", "job", job.JobID, "repo", job.Repo, "err", err)
+				slog.Warn("action cache fill failed", "job", job.JobID, "repo", job.Repo, "err", err)
 			}
 			cancel()
 		}
@@ -160,10 +160,7 @@ func (c *Cache) fill(ctx context.Context, job domain.Job) error {
 	if gc.BaseURL.Host != "api.github.com" {
 		return nil
 	}
-	owner, repo, ok := strings.Cut(job.Repo, "/")
-	if !ok {
-		return fmt.Errorf("bad repo %q", job.Repo)
-	}
+	owner, repo := jobRepo(job)
 	u, _, err := gc.Actions.GetWorkflowJobLogs(ctx, owner, repo, job.JobID, maxRedirects)
 	if err != nil {
 		return fmt.Errorf("job log url: %w", err)
@@ -181,10 +178,20 @@ func (c *Cache) fill(ctx context.Context, job domain.Job) error {
 	}
 	for _, a := range actions {
 		if err := c.store(ctx, gc, a); err != nil {
-			slog.Debug("action cache store failed", "action", a.Repo, "sha", a.SHA, "err", err)
+			slog.Warn("action cache store failed", "action", a.Repo, "sha", a.SHA, "err", err)
 		}
 	}
 	return nil
+}
+
+// jobRepo returns the job's repository owner and name. The poll source sets
+// Repo to the bare name; the owner is the scope's org or owner/repo prefix.
+func jobRepo(job domain.Job) (owner, repo string) {
+	if o, r, ok := domain.SplitRepoScope(job.Repo); ok {
+		return o, r
+	}
+	owner, _, _ = strings.Cut(job.Org, "/")
+	return owner, job.Repo
 }
 
 // store downloads one archive unless it is cached or not public.
@@ -241,6 +248,7 @@ func (c *Cache) store(ctx context.Context, gc *github.Client, a Action) error {
 		_ = os.Remove(tmp.Name())
 		return err
 	}
+	slog.Info("action cached", "action", name, "sha", a.SHA, "bytes", n)
 	return c.evict()
 }
 
