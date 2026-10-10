@@ -1,6 +1,6 @@
 # Hosted control plane (cp.ushr.io). Always-on: agents hold long-polls, so the
 # machine must not scale to zero. Colocated with Neon in iad.
-app = "ushr-cp"
+app = "ushr-cp2"
 primary_region = "iad"
 # Deploy from the repo root so the build context includes go.mod:
 #   fly deploy --config deploy/fly/fly.toml --dockerfile deploy/fly/Dockerfile
