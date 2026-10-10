@@ -5,6 +5,15 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.14 — 2026-10-10
+
+- Each host caches public GitHub Action archives and shares them read-only
+  with every runner through `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE`, so jobs
+  skip re-downloading actions. The poll source fills the cache from each
+  job's log. v0.2.12 and v0.2.13 shipped the cache, but every fill failed.
+- fix(actioncache): take the job owner from its scope. Fill errors now log
+  as warnings.
+
 ## v0.2.13 — 2026-10-09
 
 - Releases sign `checksums.txt` with keyless cosign and publish an SBOM for
