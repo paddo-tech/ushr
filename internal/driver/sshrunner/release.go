@@ -31,6 +31,11 @@ func FetchLatest(ctx context.Context, dir, keep string) (Runner, error) {
 	defer cancel()
 	version, digest, err := latestRelease(ctx)
 	if err != nil {
+		// The lookup is unauthenticated, so a shared IP's 60/hour limit can
+		// block it; a cached archive passed its checksum and still runs jobs.
+		if r, ok := newestCached(dir); ok {
+			return r, nil
+		}
 		return Runner{}, err
 	}
 	r := Runner{Version: version, Tar: filepath.Join(dir, "actions-runner-"+version+".tar.gz")}
@@ -47,6 +52,32 @@ func FetchLatest(ctx context.Context, dir, keep string) (Runner, error) {
 		}
 	}
 	return r, nil
+}
+
+// newestCached returns the most recently written archive in dir.
+func newestCached(dir string) (Runner, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return Runner{}, false
+	}
+	var best Runner
+	var bestMod time.Time
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "actions-runner-") || !strings.HasSuffix(name, ".tar.gz") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || !fi.Mode().IsRegular() || fi.ModTime().Before(bestMod) {
+			continue
+		}
+		best = Runner{
+			Version: strings.TrimSuffix(strings.TrimPrefix(name, "actions-runner-"), ".tar.gz"),
+			Tar:     filepath.Join(dir, name),
+		}
+		bestMod = fi.ModTime()
+	}
+	return best, best.Version != ""
 }
 
 func latestRelease(ctx context.Context) (string, string, error) {

@@ -114,8 +114,17 @@ func TestFetchLatestRejectsIncompleteRelease(t *testing.T) {
 			if failure == "cancelled" {
 				cancel()
 			}
-			if _, err := FetchLatest(ctx, dir, previous); err == nil {
-				t.Fatal("accepted an incomplete release")
+			r, err := FetchLatest(ctx, dir, previous)
+			switch failure {
+			case "metadata", "checksum missing", "cancelled":
+				// No usable lookup: the verified cached archive runs jobs.
+				if err != nil || r.Tar != previous || r.Version != "2.336.0" {
+					t.Fatalf("lookup failure = %+v, %v; want cached %s", r, err, previous)
+				}
+			default:
+				if err == nil {
+					t.Fatal("accepted an incomplete release")
+				}
 			}
 			entries, err := os.ReadDir(dir)
 			if err != nil {
