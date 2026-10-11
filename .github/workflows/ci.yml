@@ -13,7 +13,7 @@ jobs:
     # Self-hosted runners must never execute fork PRs, even while the repo is
     # private and forks are restricted.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ushr-linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,7 +28,7 @@ jobs:
 
   lint:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ushr-linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
