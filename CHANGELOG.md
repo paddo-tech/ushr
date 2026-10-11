@@ -5,6 +5,12 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.16 — 2026-10-11
+
+- fix(sshrunner): when the runner release lookup fails, Mac hosts use the
+  newest verified runner archive in their cache. Before, an exhausted
+  unauthenticated GitHub API limit made every Mac job fail after a restart.
+
 ## v0.2.15 — 2026-10-11
 
 - The scaleset source serves repo targets. Declare `scale_sets` under a
