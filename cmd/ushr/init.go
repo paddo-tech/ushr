@@ -31,9 +31,6 @@ func runInit(_ context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *scaleSet != "" && !plainScaleSetName(*scaleSet) {
-		return fmt.Errorf("--scale-set %q: use a name that starts with a letter and has only letters, digits, '.', '_' or '-', and is not null, true or false", *scaleSet)
-	}
 	dir := "."
 	if rest := fs.Args(); len(rest) > 0 {
 		// Stdlib flag stops parsing at the first positional, so a flag placed
@@ -106,16 +103,12 @@ func runInit(_ context.Context, args []string) error {
 	return nil
 }
 
-var scaleSetName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
-
-// plainScaleSetName reports whether name is spliced into YAML unquoted and
-// still reads back as that string, never as null or a boolean.
-func plainScaleSetName(name string) bool {
-	switch strings.ToLower(name) {
-	case "null", "true", "false", "yes", "no", "on", "off", "y", "n":
-		return false
-	}
-	return scaleSetName.MatchString(name)
+// yamlString renders s as a YAML scalar that reads back as the string s,
+// quoting only names a parser would otherwise take as null, bool or number.
+func yamlString(s string) string {
+	// Marshalling a plain string cannot fail.
+	out, _ := yaml.Marshal(s)
+	return strings.TrimSuffix(string(out), "\n")
 }
 
 // rewriteWorkflow rewrites every job-level runs-on target in one workflow
@@ -179,7 +172,7 @@ func rewriteWorkflow(src, scaleSet string) (string, int, []string) {
 			continue
 		}
 		if scaleSet != "" {
-			repl = scaleSet
+			repl = yamlString(scaleSet)
 		}
 
 		// mapTarget only maps single-label targets, so the value is one node:

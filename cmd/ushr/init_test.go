@@ -227,13 +227,16 @@ func TestRewriteWorkflowWarningLineNumbers(t *testing.T) {
 	}
 }
 
-func TestPlainScaleSetName(t *testing.T) {
-	for name, want := range map[string]bool{
-		"ushr-linux": true, "pba.arc_runners": true,
-		"null": false, "True": false, "off": false, "1runner": false, "a b": false, "~": false, "": false,
+func TestYAMLString(t *testing.T) {
+	for in, want := range map[string]string{
+		"ushr-linux": "ushr-linux",
+		"1runner":    "1runner",
+		"2025":       `"2025"`,
+		"null":       `"null"`,
+		"true":       `"true"`,
 	} {
-		if got := plainScaleSetName(name); got != want {
-			t.Errorf("plainScaleSetName(%q) = %v, want %v", name, got, want)
+		if got := yamlString(in); got != want {
+			t.Errorf("yamlString(%q) = %s, want %s", in, got, want)
 		}
 	}
 }
