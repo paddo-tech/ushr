@@ -5,6 +5,8 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.15 — 2026-10-11
+
 - The scaleset source serves repo targets. Declare `scale_sets` under a
   `repos` entry to give a personal-account repo a repo-level scale set. In
   scaleset mode, every org and repo target must declare `scale_sets`.
