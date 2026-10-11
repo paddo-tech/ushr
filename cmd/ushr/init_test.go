@@ -226,3 +226,14 @@ func TestRewriteWorkflowWarningLineNumbers(t *testing.T) {
 		t.Errorf("warning should cite original line 6, got %v", warns)
 	}
 }
+
+func TestPlainScaleSetName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"ushr-linux": true, "pba.arc_runners": true,
+		"null": false, "True": false, "off": false, "1runner": false, "a b": false, "~": false, "": false,
+	} {
+		if got := plainScaleSetName(name); got != want {
+			t.Errorf("plainScaleSetName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

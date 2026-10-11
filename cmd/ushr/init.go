@@ -31,6 +31,9 @@ func runInit(_ context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *scaleSet != "" && !plainScaleSetName(*scaleSet) {
+		return fmt.Errorf("--scale-set %q: use a name that starts with a letter and has only letters, digits, '.', '_' or '-', and is not null, true or false", *scaleSet)
+	}
 	dir := "."
 	if rest := fs.Args(); len(rest) > 0 {
 		// Stdlib flag stops parsing at the first positional, so a flag placed
@@ -101,6 +104,18 @@ func runInit(_ context.Context, args []string) error {
 		fmt.Println("    run `ushr setup --org ORG` (or --repo OWNER/REPO) if it doesn't.")
 	}
 	return nil
+}
+
+var scaleSetName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
+
+// plainScaleSetName reports whether name is spliced into YAML unquoted and
+// still reads back as that string, never as null or a boolean.
+func plainScaleSetName(name string) bool {
+	switch strings.ToLower(name) {
+	case "null", "true", "false", "yes", "no", "on", "off", "y", "n":
+		return false
+	}
+	return scaleSetName.MatchString(name)
 }
 
 // rewriteWorkflow rewrites every job-level runs-on target in one workflow

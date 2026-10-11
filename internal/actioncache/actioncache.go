@@ -229,7 +229,7 @@ func jobRepo(job domain.Job) (owner, repo string) {
 // runnerJob returns the id of the job in run runID that ran on runner, 0 if
 // none did.
 func runnerJob(ctx context.Context, gc *github.Client, owner, repo string, runID int64, runner string) (int64, error) {
-	opts := &github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}}
+	opts := &github.ListWorkflowJobsOptions{Filter: "all", ListOptions: github.ListOptions{PerPage: 100}}
 	for {
 		jobs, resp, err := gc.Actions.ListWorkflowJobs(ctx, owner, repo, runID, opts)
 		if err != nil {
