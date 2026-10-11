@@ -55,8 +55,9 @@ source:
   type: poll
   interval: 30s               # how often to poll GitHub for queued runs
   # Or Runner Scale Sets (no polling: GitHub pushes desired counts; the set
-  # name doubles as the runs-on label). Declare sets under the org:
-  #   orgs[].scale_sets:
+  # name doubles as the runs-on label). Declare sets under the org, or under
+  # a repo target (personal accounts):
+  #   orgs[].scale_sets:   (or repos[].scale_sets:)
   #     - name: my-scale-set
   #       max_runners: 8
   # type: scaleset

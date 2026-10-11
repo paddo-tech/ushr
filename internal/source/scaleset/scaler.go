@@ -72,13 +72,15 @@ type scalesetAPI interface {
 // backstop instead of startedTTL. Fixing either needs reconciliation against
 // GitHub's live runner list — not worth it until observed in practice.
 type scaler struct {
-	org string
-	set config.ScaleSet
-	id  int // scale set ID
-	api scalesetAPI
-	out chan<- domain.Job
-	now func() time.Time
-	ids *atomic.Int64
+	scope string // org login, or owner/repo for a repo set
+	set   config.ScaleSet
+	id    int // scale set ID
+	api   scalesetAPI
+	out   chan<- domain.Job
+	now   func() time.Time
+	ids   *atomic.Int64
+	// completed is Source.Completed; nil means nothing listens.
+	completed func(scope, owner, repo string, runID int64, runner string)
 
 	mu      sync.Mutex
 	pending map[int64]struct{}     // jobID emitted, not yet dispatched
@@ -90,9 +92,9 @@ type liveRunner struct {
 	started  bool
 }
 
-func newScaler(org string, set config.ScaleSet, id int, api scalesetAPI, out chan<- domain.Job, ids *atomic.Int64) *scaler {
+func newScaler(scope string, set config.ScaleSet, id int, api scalesetAPI, out chan<- domain.Job, ids *atomic.Int64) *scaler {
 	return &scaler{
-		org:     org,
+		scope:   scope,
 		set:     set,
 		id:      id,
 		api:     api,
@@ -121,7 +123,7 @@ func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		}
 		if now.Sub(l.mintedAt) > ttl {
 			slog.Warn("expiring stale runner from ledger (lost done-report?)",
-				"org", s.org, "set", s.set.Name, "runner", name, "started", l.started)
+				"scope", s.scope, "set", s.set.Name, "runner", name, "started", l.started)
 			delete(s.live, name)
 			reap = append(reap, name)
 		}
@@ -140,7 +142,7 @@ func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			// this instant is protected GitHub-side (and GitHub reassigns jobs
 			// whose runner vanishes), so the race is benign.
 			slog.Info("scaling down idle runner",
-				"org", s.org, "set", s.set.Name, "runner", name)
+				"scope", s.scope, "set", s.set.Name, "runner", name)
 			delete(s.live, name)
 			reap = append(reap, name)
 			excess--
@@ -152,7 +154,7 @@ func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		id := s.ids.Add(-1)
 		s.pending[id] = struct{}{}
 		jobs = append(jobs, domain.Job{
-			Org:      s.org,
+			Org:      s.scope,
 			JobID:    id,
 			Labels:   []string{s.set.Name},
 			QueuedAt: now,
@@ -181,7 +183,7 @@ func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			s.mu.Unlock()
 			return outstanding - (len(jobs) - i), ctx.Err()
 		case s.out <- job:
-			slog.Info("scale set runner requested", "org", s.org, "set", s.set.Name, "job", job.JobID)
+			slog.Info("scale set runner requested", "scope", s.scope, "set", s.set.Name, "job", job.JobID)
 		}
 	}
 	return outstanding, nil
@@ -194,7 +196,7 @@ func (s *scaler) HandleJobStarted(_ context.Context, info *scaleset.JobStarted) 
 	}
 	s.mu.Unlock()
 	slog.Info("job started",
-		"org", s.org, "set", s.set.Name, "runner", info.RunnerName,
+		"scope", s.scope, "set", s.set.Name, "runner", info.RunnerName,
 		"repo", info.RepositoryName, "job", info.JobDisplayName)
 	return nil
 }
@@ -204,8 +206,11 @@ func (s *scaler) HandleJobCompleted(_ context.Context, info *scaleset.JobComplet
 	delete(s.live, info.RunnerName)
 	s.mu.Unlock()
 	slog.Info("job completed",
-		"org", s.org, "set", s.set.Name, "runner", info.RunnerName,
+		"scope", s.scope, "set", s.set.Name, "runner", info.RunnerName,
 		"repo", info.RepositoryName, "job", info.JobDisplayName, "result", info.Result)
+	if s.completed != nil {
+		s.completed(s.scope, info.OwnerName, info.RepositoryName, info.WorkflowRunID, info.RunnerName)
+	}
 	return nil
 }
 
@@ -226,7 +231,7 @@ func (s *scaler) mintRunner(ctx context.Context, name string, jobID int64) (stri
 	cfg, err := s.api.GenerateJitRunnerConfig(ctx,
 		&scaleset.RunnerScaleSetJitRunnerSetting{Name: name, WorkFolder: workFolder}, s.id)
 	if err != nil {
-		return "", fmt.Errorf("generate jit config for %s/%s: %w", s.org, s.set.Name, err)
+		return "", fmt.Errorf("generate jit config for %s/%s: %w", s.scope, s.set.Name, err)
 	}
 	s.mu.Lock()
 	delete(s.pending, jobID)

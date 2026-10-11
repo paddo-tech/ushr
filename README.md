@@ -14,7 +14,7 @@ dashboard — the key still never leaves your box.
 
 | Binary | Role |
 |---|---|
-| `ushr` | User-facing CLI. `ushr login` sets a host up end to end for the hosted plane; `ushr setup --org NAME` creates the GitHub App and records it in `agent.yaml`; `ushr doctor` checks host health; `ushr init [dir]` rewrites a repo's workflow `runs-on` targets to ushr labels. |
+| `ushr` | User-facing CLI. `ushr login` sets a host up end to end for the hosted plane; `ushr setup --org NAME` creates the GitHub App and records it in `agent.yaml`; `ushr doctor` checks host health; `ushr init [dir]` rewrites a repo's workflow `runs-on` targets to ushr labels (`--scale-set NAME` targets a scale set). |
 | `ushr-controller` | Schedules queued jobs across agents over a long-poll HTTP API (keyless: agents report metadata, the controller holds no GitHub credentials) |
 | `ushr-agent` | Runs on the runner host. Holds the GitHub App keys, watches GitHub for queued jobs, mints JIT configs, and uses the configured Driver (Tart on macOS, docker/podman on Linux) to provision/destroy ephemeral runners |
 
@@ -72,7 +72,43 @@ New runners then copy the archive from the host instead of downloading it from G
 The agent caches only actions from public repositories, because all orgs on a host share the cache.
 The cache is in `<state_dir>/actions` (default `~/.local/share/ushr/actions`) and holds at most 2 GB.
 Each runner gets the cache as a read-only mount, and `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE` gives its path.
-The scaleset source does not fill the cache.
+Both sources fill the cache.
+The poll source fills it after each dispatch.
+The scaleset source fills it when GitHub reports a job complete.
+It finds the job in the workflow run by the runner name.
+
+## Scale-set source
+
+With `source.type: scaleset`, GitHub pushes each scale set's desired runner count to the agent.
+The agent does not poll.
+A scale set's name is the `runs-on` label that workflows target.
+Declare scale sets under an org, or under a repo target:
+
+```yaml
+orgs:
+  - name: YOUR_ORG
+    app_id: 12
+    private_key_path: ~/.secrets/ushr-YOUR_ORG.pem
+    scale_sets:
+      - name: ushr-linux
+        max_runners: 8
+repos:
+  - owner: YOUR_USER
+    repo: YOUR_REPO
+    app_id: 34
+    private_key_path: ~/.secrets/ushr-YOUR_USER-YOUR_REPO.pem
+    scale_sets:
+      - name: ushr-mac
+        max_runners: 2
+source:
+  type: scaleset
+```
+
+Personal accounts have no org runner pool, so they use repo targets.
+A repo scale set serves only its repo, and it is in the repo's default runner group.
+In scaleset mode, each org and repo target must declare `scale_sets`.
+To point a repo's workflows at a scale set, run `ushr init --scale-set NAME [dir]`.
+It rewrites the same `runs-on` targets as `ushr init`, but to the plain label `NAME`.
 
 ## GitHub Enterprise Server
 

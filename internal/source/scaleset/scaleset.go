@@ -15,8 +15,9 @@
 // the whole polling cost class: no repo list scans, no rate-limit breaker, no
 // dedup of re-listed jobs.
 //
-// A scale set's name doubles as the runs-on label workflows target, and repo
-// scoping is enforced GitHub-side by the runner group the set lives in.
+// A scale set's name doubles as the runs-on label workflows target. An org
+// set's repo scoping is enforced GitHub-side by the runner group the set lives
+// in; a repo set (the personal-account path) serves only its repo.
 package scaleset
 
 import (
@@ -48,32 +49,68 @@ const listenerRestartDelay = 30 * time.Second
 // their JIT configs at dispatch (it implements the server's JITMinter and
 // DispatchObserver).
 type Source struct {
-	orgs    []config.Org
+	// Completed, when set before Subscribe, receives every job completion a
+	// set reports: the job's scope, its repo, its workflow run and the runner
+	// it ran on. It runs on the listener goroutine, so it must not block.
+	Completed func(scope, owner, repo string, runID int64, runner string)
+
+	targets []target
 	version string
 	ids     atomic.Int64
 	scalers []*scaler
 }
 
-// New validates the org/set configuration. Credentials are only exercised on
-// Subscribe.
-func New(orgs []config.Org, version string) (*Source, error) {
-	if len(orgs) == 0 {
-		return nil, errors.New("scaleset source: no orgs configured")
+// target is one org or repo whose scale sets this source serves.
+type target struct {
+	auth    gh.AppAuth
+	groupID int
+	sets    []config.ScaleSet
+}
+
+// New validates the org, repo and set configuration. Credentials are only
+// exercised on Subscribe.
+func New(orgs []config.Org, repos []config.RepoTarget, version string) (*Source, error) {
+	if len(orgs) == 0 && len(repos) == 0 {
+		return nil, errors.New("scaleset source: no orgs or repos configured")
 	}
+	var targets []target
 	for _, o := range orgs {
-		if len(o.ScaleSets) == 0 {
-			return nil, fmt.Errorf("scaleset source: org %s has no scale_sets", o.Name)
+		groupID := o.RunnerGroupID
+		if groupID == 0 {
+			groupID = config.DefaultRunnerGroupID
 		}
-		for _, s := range o.ScaleSets {
+		targets = append(targets, target{
+			auth:    gh.AppAuth{AppID: o.AppID, PrivateKeyPath: o.PrivateKeyPath, Org: o.Name, BaseURL: o.BaseURL},
+			groupID: int(groupID),
+			sets:    o.ScaleSets,
+		})
+	}
+	// Runner groups are org-only: a repo's sets live in the default group.
+	for _, r := range repos {
+		targets = append(targets, target{
+			auth:    gh.AppAuth{AppID: r.AppID, PrivateKeyPath: r.PrivateKeyPath, Owner: r.Owner, Repo: r.Repo, BaseURL: r.BaseURL},
+			groupID: int(config.DefaultRunnerGroupID),
+			sets:    r.ScaleSets,
+		})
+	}
+	for _, t := range targets {
+		kind := "org"
+		if t.auth.Repo != "" {
+			kind = "repo"
+		}
+		if len(t.sets) == 0 {
+			return nil, fmt.Errorf("scaleset source: %s %s has no scale_sets", kind, t.auth.Scope())
+		}
+		for _, s := range t.sets {
 			if s.Name == "" {
-				return nil, fmt.Errorf("scaleset source: org %s has a scale set without a name", o.Name)
+				return nil, fmt.Errorf("scaleset source: %s %s has a scale set without a name", kind, t.auth.Scope())
 			}
 			if s.MaxRunners <= 0 {
-				return nil, fmt.Errorf("scaleset source: scale set %s/%s needs max_runners > 0", o.Name, s.Name)
+				return nil, fmt.Errorf("scaleset source: scale set %s/%s needs max_runners > 0", t.auth.Scope(), s.Name)
 			}
 		}
 	}
-	s := &Source{orgs: orgs, version: version}
+	s := &Source{targets: targets, version: version}
 	var seed [8]byte
 	_, _ = rand.Read(seed[:])
 	// Negative request IDs cannot collide with GitHub job IDs or restart from one.
@@ -88,38 +125,40 @@ func New(orgs []config.Org, version string) (*Source, error) {
 // wound down.
 func (s *Source) Subscribe(ctx context.Context) (<-chan domain.Job, error) {
 	ch := make(chan domain.Job, 64)
-	type target struct {
+	type listen struct {
 		session *scaleset.Client
 		sc      *scaler
 	}
-	var targets []target
-	for _, o := range s.orgs {
+	var listens []listen
+	for _, t := range s.targets {
 		// Separate clients for the session listeners and for dispatch-time
 		// mints: the lib client's mutex is held across whole HTTPS round-trips
 		// (including retry backoff), so sharing one would let a slow mint stall
 		// session refreshes and serialize every concurrent dispatch behind it.
-		session, err := newClient(ctx, o, s.version)
+		session, err := newClient(ctx, t.auth, s.version)
 		if err != nil {
 			return nil, err
 		}
-		mint, err := newClient(ctx, o, s.version)
+		mint, err := newClient(ctx, t.auth, s.version)
 		if err != nil {
 			return nil, err
 		}
-		for _, set := range o.ScaleSets {
-			id, err := ensureScaleSet(ctx, session, o, set)
+		scope := t.auth.Scope()
+		for _, set := range t.sets {
+			id, err := ensureScaleSet(ctx, session, scope, t.groupID, set)
 			if err != nil {
 				return nil, err
 			}
-			sc := newScaler(o.Name, set, id, mint, ch, &s.ids)
+			sc := newScaler(scope, set, id, mint, ch, &s.ids)
+			sc.completed = s.Completed
 			s.scalers = append(s.scalers, sc)
-			targets = append(targets, target{session: session, sc: sc})
-			slog.Info("scale set ready", "org", o.Name, "set", set.Name, "id", id, "max_runners", set.MaxRunners)
+			listens = append(listens, listen{session: session, sc: sc})
+			slog.Info("scale set ready", "scope", scope, "set", set.Name, "id", id, "max_runners", set.MaxRunners)
 		}
 	}
 
 	var wg sync.WaitGroup
-	for _, t := range targets {
+	for _, t := range listens {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -169,20 +208,22 @@ func (s *Source) DispatchDone(handle string, failed bool) {
 }
 
 // newClient builds a scale set API client authenticated as the App
-// installation in the org, sharing the poll source's installation discovery.
-func newClient(ctx context.Context, o config.Org, version string) (*scaleset.Client, error) {
-	key, err := os.ReadFile(o.PrivateKeyPath)
+// installation on a's org or repo, sharing the poll source's installation
+// discovery. The config URL's path (org, or owner/repo) sets the registration
+// scope.
+func newClient(ctx context.Context, a gh.AppAuth, version string) (*scaleset.Client, error) {
+	key, err := os.ReadFile(a.PrivateKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("read app key: %w", err)
 	}
-	installID, err := gh.InstallationID(ctx, o.AppID, key, gh.AppAuth{Org: o.Name, BaseURL: o.BaseURL})
+	installID, err := gh.InstallationID(ctx, a.AppID, key, a)
 	if err != nil {
 		return nil, err
 	}
 	return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: gh.WebURL(o.BaseURL) + "/" + o.Name,
+		GitHubConfigURL: gh.WebURL(a.BaseURL) + "/" + a.Scope(),
 		GitHubAppAuth: scaleset.GitHubAppAuth{
-			ClientID:       strconv.FormatInt(o.AppID, 10),
+			ClientID:       strconv.FormatInt(a.AppID, 10),
 			InstallationID: installID,
 			PrivateKey:     string(key),
 		},
@@ -195,15 +236,11 @@ func newClient(ctx context.Context, o config.Org, version string) (*scaleset.Cli
 }
 
 // ensureScaleSet returns the scale set's ID, creating it if it doesn't exist
-// yet. Existing sets are matched by name within the org's runner group.
-func ensureScaleSet(ctx context.Context, client *scaleset.Client, o config.Org, set config.ScaleSet) (int, error) {
-	groupID := int(o.RunnerGroupID)
-	if groupID == 0 {
-		groupID = int(config.DefaultRunnerGroupID)
-	}
+// yet. Existing sets are matched by name within the scope's runner group.
+func ensureScaleSet(ctx context.Context, client *scaleset.Client, scope string, groupID int, set config.ScaleSet) (int, error) {
 	existing, err := client.GetRunnerScaleSet(ctx, groupID, set.Name)
 	if err != nil {
-		return 0, fmt.Errorf("get scale set %s/%s: %w", o.Name, set.Name, err)
+		return 0, fmt.Errorf("get scale set %s/%s: %w", scope, set.Name, err)
 	}
 	if existing != nil {
 		return existing.ID, nil
@@ -215,7 +252,7 @@ func ensureScaleSet(ctx context.Context, client *scaleset.Client, o config.Org, 
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 	})
 	if err != nil {
-		return 0, fmt.Errorf("create scale set %s/%s: %w", o.Name, set.Name, err)
+		return 0, fmt.Errorf("create scale set %s/%s: %w", scope, set.Name, err)
 	}
 	return created.ID, nil
 }
@@ -231,7 +268,7 @@ func runListener(ctx context.Context, client *scaleset.Client, sc *scaler) {
 			return
 		}
 		slog.Warn("scale set listener exited, restarting",
-			"org", sc.org, "set", sc.set.Name, "delay", listenerRestartDelay, "err", err)
+			"scope", sc.scope, "set", sc.set.Name, "delay", listenerRestartDelay, "err", err)
 		select {
 		case <-ctx.Done():
 			return

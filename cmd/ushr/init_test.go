@@ -9,10 +9,38 @@ func TestRewriteWorkflow(t *testing.T) {
 	tests := []struct {
 		name        string
 		in          string
+		scaleSet    string
 		want        string
 		wantChanged int
 		wantWarns   int
 	}{
+		{
+			name:        "scale set scalar",
+			in:          "jobs:\n  build:\n    runs-on: ubuntu-latest # ci\n",
+			scaleSet:    "ushr-linux",
+			want:        "jobs:\n  build:\n    runs-on: ushr-linux # ci\n",
+			wantChanged: 1,
+		},
+		{
+			name:        "scale set block seq folds",
+			in:          "jobs:\n  build:\n    runs-on:\n      - macos-15\n",
+			scaleSet:    "ushr-mac",
+			want:        "jobs:\n  build:\n    runs-on: ushr-mac\n",
+			wantChanged: 1,
+		},
+		{
+			name:     "scale set leaves self-hosted and custom labels",
+			in:       "jobs:\n  a:\n    runs-on: [self-hosted, Linux]\n  b:\n    runs-on: my-pool\n",
+			scaleSet: "ushr-linux",
+			want:     "jobs:\n  a:\n    runs-on: [self-hosted, Linux]\n  b:\n    runs-on: my-pool\n",
+		},
+		{
+			name:      "scale set keeps intel mac warning",
+			in:        "jobs:\n  build:\n    runs-on: macos-13\n",
+			scaleSet:  "ushr-mac",
+			want:      "jobs:\n  build:\n    runs-on: macos-13\n",
+			wantWarns: 1,
+		},
 		{
 			name:        "scalar ubuntu",
 			in:          "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n",
@@ -172,7 +200,7 @@ func TestRewriteWorkflow(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, changed, warns := rewriteWorkflow(tt.in)
+			got, changed, warns := rewriteWorkflow(tt.in, tt.scaleSet)
 			if got != tt.want {
 				t.Errorf("output mismatch\n got: %q\nwant: %q", got, tt.want)
 			}
@@ -190,7 +218,7 @@ func TestRewriteWorkflowWarningLineNumbers(t *testing.T) {
 	// A block-seq rewrite above must not shift the reported line of a warning
 	// below it.
 	in := "jobs:\n  a:\n    runs-on:\n      - ubuntu-latest\n  b:\n    runs-on: windows-latest\n"
-	_, changed, warns := rewriteWorkflow(in)
+	_, changed, warns := rewriteWorkflow(in, "")
 	if changed != 1 {
 		t.Fatalf("changed = %d, want 1", changed)
 	}

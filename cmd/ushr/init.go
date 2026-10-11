@@ -27,6 +27,7 @@ var (
 func runInit(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "report what would change without writing files")
+	scaleSet := fs.String("scale-set", "", "target this runner scale set by name instead of ushr's self-hosted labels")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -62,7 +63,7 @@ func runInit(_ context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		out, jobs, warns := rewriteWorkflow(string(src))
+		out, jobs, warns := rewriteWorkflow(string(src), *scaleSet)
 		for _, w := range warns {
 			warnings = append(warnings, fmt.Sprintf("%s:%s", rel, w))
 		}
@@ -91,7 +92,11 @@ func runInit(_ context.Context, args []string) error {
 		fmt.Println("==> Dry run — no files written.")
 	case rewrote > 0:
 		fmt.Println()
-		fmt.Println("==> Done. Jobs now target ushr's self-hosted labels.")
+		if *scaleSet != "" {
+			fmt.Printf("==> Done. Jobs now target the %s scale set.\n", *scaleSet)
+		} else {
+			fmt.Println("==> Done. Jobs now target ushr's self-hosted labels.")
+		}
 		fmt.Println("    Make sure the ushr GitHub App covers this repo —")
 		fmt.Println("    run `ushr setup --org ORG` (or --repo OWNER/REPO) if it doesn't.")
 	}
@@ -103,8 +108,9 @@ func runInit(_ context.Context, args []string) error {
 // `with:` inputs or `run:` scripts are never touched); the edit itself is a
 // text splice, keeping every untouched line byte-for-byte. Returns the new
 // content, how many targets changed, and "line: message" warnings for targets
-// it can't rewrite safely.
-func rewriteWorkflow(src string) (string, int, []string) {
+// it can't rewrite safely. A non-empty scaleSet replaces each rewritten target
+// with that set's name, the one label a scale set's runners match.
+func rewriteWorkflow(src, scaleSet string) (string, int, []string) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(src), &doc); err != nil {
 		return src, 0, []string{fmt.Sprintf("1: not valid YAML — left unchanged (%v)", err)}
@@ -156,6 +162,9 @@ func rewriteWorkflow(src string) (string, int, []string) {
 		}
 		if repl == "" {
 			continue
+		}
+		if scaleSet != "" {
+			repl = scaleSet
 		}
 
 		// mapTarget only maps single-label targets, so the value is one node:

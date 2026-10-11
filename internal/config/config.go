@@ -98,6 +98,9 @@ type RepoTarget struct {
 	Priority       int    `yaml:"priority,omitempty"`
 	// BaseURL is the GitHub Enterprise Server root; empty means github.com.
 	BaseURL string `yaml:"base_url,omitempty"`
+	// ScaleSets lists the repo-level runner scale sets to serve. Scaleset
+	// source only; a repo scale set serves only this repo.
+	ScaleSets []ScaleSet `yaml:"scale_sets,omitempty"`
 }
 
 // Scope is the tenant scope ("owner/repo") this target serves; matches the

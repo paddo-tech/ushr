@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-github/v84/github"
+
 	"github.com/paddo-tech/ushr/internal/domain"
 )
 
@@ -53,6 +55,19 @@ func TestJobRepo(t *testing.T) {
 	} {
 		if o, r := jobRepo(tc.job); o != tc.owner || r != tc.repo {
 			t.Errorf("jobRepo(%+v) = %s/%s, want %s/%s", tc.job, o, r, tc.owner, tc.repo)
+		}
+	}
+}
+
+func TestJobOnRunner(t *testing.T) {
+	jobs := []*github.WorkflowJob{
+		{ID: github.Ptr(int64(1))},
+		{ID: github.Ptr(int64(2)), RunnerName: github.Ptr("ushr-set-a")},
+		{ID: github.Ptr(int64(3)), RunnerName: github.Ptr("ushr-set-b")},
+	}
+	for runner, want := range map[string]int64{"ushr-set-b": 3, "ushr-set-a": 2, "ushr-set": 0} {
+		if got := jobOnRunner(jobs, runner); got != want {
+			t.Errorf("jobOnRunner(%q) = %d, want %d", runner, got, want)
 		}
 	}
 }

@@ -41,7 +41,7 @@ func TestNewSourceWiresPollFreshness(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	_, _, _, fresh, err := newSource(ctx, cfg, metrics.NewAgent(""))
+	_, _, _, fresh, err := newSource(ctx, cfg, metrics.NewAgent(""), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

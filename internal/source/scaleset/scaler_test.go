@@ -267,6 +267,47 @@ func TestJobCompletedFreesSlot(t *testing.T) {
 	}
 }
 
+func TestJobCompletedReportsRunAndRunner(t *testing.T) {
+	sc, _, _, _ := newTestScaler(8)
+	var got []any
+	sc.completed = func(scope, owner, repo string, runID int64, runner string) {
+		got = []any{scope, owner, repo, runID, runner}
+	}
+	_ = sc.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		JobMessageBase: scaleset.JobMessageBase{OwnerName: "paddo-tech", RepositoryName: "ushr", WorkflowRunID: 99, JobID: "not-a-rest-id"},
+		RunnerName:     "ushr-pba-arc-runners-x",
+	})
+	want := []any{"paddo-tech", "paddo-tech", "ushr", int64(99), "ushr-pba-arc-runners-x"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("completed(%v), want %v", got, want)
+	}
+}
+
+func TestNewServesOrgAndRepoTargets(t *testing.T) {
+	sets := []config.ScaleSet{{Name: "runners", MaxRunners: 1}}
+	src, err := New(
+		[]config.Org{{Name: "acme", RunnerGroupID: 5, ScaleSets: sets}},
+		[]config.RepoTarget{{Owner: "paddo", Repo: "blog", ScaleSets: sets}},
+		"test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, tg := range src.targets {
+		got = append(got, fmt.Sprintf("%s:%d", tg.auth.Scope(), tg.groupID))
+	}
+	if want := []string{"acme:5", "paddo/blog:1"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+
+	if _, err := New(nil, []config.RepoTarget{{Owner: "paddo", Repo: "blog"}}, "test"); err == nil || !strings.Contains(err.Error(), "repo paddo/blog has no scale_sets") {
+		t.Fatalf("repo target without scale_sets: err = %v", err)
+	}
+	if _, err := New(nil, nil, "test"); err == nil {
+		t.Fatal("no targets: want error")
+	}
+}
+
 func TestProvisionTTLExpiresNeverStartedRunner(t *testing.T) {
 	sc, _, out, now := newTestScaler(8)
 	_, _ = sc.HandleDesiredRunnerCount(context.Background(), 1)
@@ -396,11 +437,11 @@ func TestOverSupplyScalesDownSeasonedIdleRunners(t *testing.T) {
 
 func TestSourceRequestsSurviveRestartWithoutIDReuse(t *testing.T) {
 	orgs := []config.Org{{Name: "example", ScaleSets: []config.ScaleSet{{Name: "runners", MaxRunners: 1}}}}
-	first, err := New(orgs, "test")
+	first, err := New(orgs, nil, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := New(orgs, "test")
+	second, err := New(orgs, nil, "test")
 	if err != nil {
 		t.Fatal(err)
 	}

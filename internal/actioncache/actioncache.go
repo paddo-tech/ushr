@@ -97,26 +97,32 @@ func Path(dir, repo, sha string) string {
 type Cache struct {
 	Dir      string
 	MaxBytes int64
+	// Client returns the job scope's App client. Set it before the first fill.
+	Client func(scope string) *github.Client
 
-	client func(scope string) *github.Client
-	http   *http.Client
-	queue  chan domain.Job
+	http  *http.Client
+	queue chan fill
 
 	mu sync.Mutex // serializes renames, eviction and reclaim
 }
 
-// New creates dir and returns a cache whose fills authenticate with the job
-// scope's App client.
-func New(dir string, client func(scope string) *github.Client) (*Cache, error) {
+// fill is one queued fill. A scale-set completion names the runner, not the
+// job, so runner is set and the job id is resolved from the run.
+type fill struct {
+	job    domain.Job
+	runner string
+}
+
+// New creates dir and returns a cache. Fills authenticate with Client.
+func New(dir string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("action cache dir: %w", err)
 	}
 	return &Cache{
 		Dir:      dir,
 		MaxBytes: DefaultMaxBytes,
-		client:   client,
 		http:     &http.Client{Timeout: fillTimeout},
-		queue:    make(chan domain.Job, queueSize),
+		queue:    make(chan fill, queueSize),
 	}, nil
 }
 
@@ -126,9 +132,24 @@ func (c *Cache) Fill(job domain.Job) {
 	if job.Repo == "" || job.JobID == 0 {
 		return
 	}
+	c.enqueue(fill{job: job})
+}
+
+// FillRun schedules a cache fill from the job that runner ran in run runID of
+// owner/repo, under scope's App client. Scale-set completions carry the Actions
+// service job id, not the REST one, so the fill looks the job up by runner. It
+// never blocks.
+func (c *Cache) FillRun(scope, owner, repo string, runID int64, runner string) {
+	if owner == "" || repo == "" || runID == 0 || runner == "" {
+		return
+	}
+	c.enqueue(fill{job: domain.Job{Org: scope, Repo: owner + "/" + repo, RunID: runID}, runner: runner})
+}
+
+func (c *Cache) enqueue(f fill) {
 	time.AfterFunc(logDelay, func() {
 		select {
-		case c.queue <- job:
+		case c.queue <- f:
 		default:
 		}
 	})
@@ -140,18 +161,19 @@ func (c *Cache) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case job := <-c.queue:
+		case f := <-c.queue:
 			fctx, cancel := context.WithTimeout(ctx, fillTimeout)
-			if err := c.fill(fctx, job); err != nil {
-				slog.Warn("action cache fill failed", "job", job.JobID, "repo", job.Repo, "err", err)
+			if err := c.fill(fctx, f); err != nil {
+				slog.Warn("action cache fill failed", "job", f.job.JobID, "run", f.job.RunID, "runner", f.runner, "repo", f.job.Repo, "err", err)
 			}
 			cancel()
 		}
 	}
 }
 
-func (c *Cache) fill(ctx context.Context, job domain.Job) error {
-	gc := c.client(job.Org)
+func (c *Cache) fill(ctx context.Context, f fill) error {
+	job := f.job
+	gc := c.Client(job.Org)
 	if gc == nil {
 		return fmt.Errorf("no client for scope %q", job.Org)
 	}
@@ -161,6 +183,16 @@ func (c *Cache) fill(ctx context.Context, job domain.Job) error {
 		return nil
 	}
 	owner, repo := jobRepo(job)
+	if f.runner != "" {
+		id, err := runnerJob(ctx, gc, owner, repo, job.RunID, f.runner)
+		if err != nil {
+			return err
+		}
+		if id == 0 {
+			return fmt.Errorf("no job in run %d ran on %s", job.RunID, f.runner)
+		}
+		job.JobID = id
+	}
 	u, _, err := gc.Actions.GetWorkflowJobLogs(ctx, owner, repo, job.JobID, maxRedirects)
 	if err != nil {
 		return fmt.Errorf("job log url: %w", err)
@@ -192,6 +224,36 @@ func jobRepo(job domain.Job) (owner, repo string) {
 	}
 	owner, _, _ = strings.Cut(job.Org, "/")
 	return owner, job.Repo
+}
+
+// runnerJob returns the id of the job in run runID that ran on runner, 0 if
+// none did.
+func runnerJob(ctx context.Context, gc *github.Client, owner, repo string, runID int64, runner string) (int64, error) {
+	opts := &github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		jobs, resp, err := gc.Actions.ListWorkflowJobs(ctx, owner, repo, runID, opts)
+		if err != nil {
+			return 0, fmt.Errorf("list run jobs: %w", err)
+		}
+		if id := jobOnRunner(jobs.Jobs, runner); id != 0 {
+			return id, nil
+		}
+		if resp.NextPage == 0 {
+			return 0, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// jobOnRunner returns the id of the job that ran on runner, 0 if none did.
+// Runner names are random per dispatch, so at most one job matches.
+func jobOnRunner(jobs []*github.WorkflowJob, runner string) int64 {
+	for _, j := range jobs {
+		if j.GetRunnerName() == runner {
+			return j.GetID()
+		}
+	}
+	return 0
 }
 
 // store downloads one archive unless it is cached or not public.

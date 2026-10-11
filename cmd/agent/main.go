@@ -89,7 +89,11 @@ func run(configPath string) error {
 		}
 	}
 
-	jobs, minter, prio, fresh, err := newSource(ctx, cfg, m)
+	cache, err := actioncache.New(factory.ActionCacheDir(cfg.Driver))
+	if err != nil {
+		slog.Warn("action cache disabled", "err", err)
+	}
+	jobs, minter, prio, fresh, err := newSource(ctx, cfg, m, cache)
 	if err != nil {
 		return err
 	}
@@ -104,14 +108,9 @@ func run(configPath string) error {
 	a.FailedVersion, a.FailedRequest, a.UpdateError = update.Status()
 	a.MinFreeDisk = factory.MinFreeBytes(cfg.Driver)
 	a.ReclaimFloor = factory.ReclaimFloorBytes(cfg.Driver)
-	// Scale-set jobs carry no repo or GitHub job id, so only the poll source fills.
-	if m, ok := minter.(*jit.Minter); ok {
-		if c, err := actioncache.New(factory.ActionCacheDir(cfg.Driver), m.Client); err != nil {
-			slog.Warn("action cache disabled", "err", err)
-		} else {
-			a.Actions = c
-			go c.Run(ctx)
-		}
+	if cache != nil {
+		a.Actions = cache
+		go cache.Run(ctx)
 	}
 
 	// Reap any VMs the previous process left behind (launchd SIGKILL/OOM, crash).
@@ -125,12 +124,12 @@ func run(configPath string) error {
 // newSource builds the job source and the JIT minter from the agent's org
 // config. Model B: the agent — not the control plane — holds the App keys,
 // watches GitHub (poll or scale-set message sessions), and mints. An unset
-// type defaults to poll.
-func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
+// type defaults to poll. A non-nil cache gets its App clients here.
+func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent, cache *actioncache.Cache) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
 	switch cfg.Source.Type {
 	case config.SourceTypePoll, "":
 	case config.SourceTypeScaleSet:
-		return newScaleSetSource(ctx, cfg)
+		return newScaleSetSource(ctx, cfg, cache)
 	default:
 		return nil, nil, nil, nil, fmt.Errorf("unsupported source type %q", cfg.Source.Type)
 	}
@@ -155,6 +154,9 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 			return nil, nil, nil, nil, err
 		}
 	}
+	if cache != nil {
+		cache.Client = minter.Client
+	}
 	source, err := gh.New(ctx, auths, cfg.Source.Interval, m)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -167,18 +169,36 @@ func newSource(ctx context.Context, cfg *config.Agent, m *metrics.Agent) (<-chan
 // pushes desired counts over message sessions, the source emits one job per
 // missing runner, and it mints the runner into the owning set at dispatch —
 // the same Source the standalone controller uses, with the agent's terminal
-// reports feeding its supply ledger (see agent.DispatchObserver).
-func newScaleSetSource(ctx context.Context, cfg *config.Agent) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
-	if len(cfg.Repos) > 0 {
-		return nil, nil, nil, nil, fmt.Errorf("repo targets aren't supported with the scaleset source (scale sets are org-level)")
-	}
-	src, err := scaleset.New(cfg.Orgs, version.Version)
+// reports feeding its supply ledger (see agent.DispatchObserver). Scale-set
+// jobs carry no repo or GitHub job id, so the cache fills from the sets'
+// job-completed messages instead of from dispatches.
+func newScaleSetSource(ctx context.Context, cfg *config.Agent, cache *actioncache.Cache) (<-chan domain.Job, agent.Minter, map[string]int, agent.Freshness, error) {
+	src, err := scaleset.New(cfg.Orgs, cfg.Repos, version.Version)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	prio := make(map[string]int, len(cfg.Orgs))
+	prio := make(map[string]int, len(cfg.Orgs)+len(cfg.Repos))
 	for _, o := range cfg.Orgs {
 		prio[o.Name] = o.Priority
+	}
+	for _, r := range cfg.Repos {
+		prio[r.Scope()] = r.Priority
+	}
+	if cache != nil {
+		// The minter only holds the per-scope REST clients here; the source mints.
+		clients := jit.New()
+		for _, o := range cfg.Orgs {
+			if err := clients.Add(ctx, gh.AppAuth{AppID: o.AppID, PrivateKeyPath: o.PrivateKeyPath, Org: o.Name, BaseURL: o.BaseURL}, 0); err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+		for _, r := range cfg.Repos {
+			if err := clients.Add(ctx, gh.AppAuth{AppID: r.AppID, PrivateKeyPath: r.PrivateKeyPath, Owner: r.Owner, Repo: r.Repo, BaseURL: r.BaseURL}, 0); err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+		cache.Client = clients.Client
+		src.Completed = cache.FillRun
 	}
 	jobs, err := src.Subscribe(ctx)
 	return jobs, src, prio, nil, err

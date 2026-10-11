@@ -5,6 +5,15 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+- The scaleset source serves repo targets. Declare `scale_sets` under a
+  `repos` entry to give a personal-account repo a repo-level scale set. In
+  scaleset mode, every org and repo target must declare `scale_sets`.
+- The scaleset source fills the action cache. On each job-completed
+  message, the agent finds the job in its workflow run by runner name and
+  reads its log.
+- `ushr init --scale-set NAME` rewrites workflow `runs-on` targets to the
+  scale set's name.
+
 ## v0.2.14 — 2026-10-10
 
 - Each host caches public GitHub Action archives and shares them read-only
