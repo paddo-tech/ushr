@@ -408,6 +408,7 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		Capacity: req.Capacity, Busy: len(req.Busy), QueueDepth: queueDepth(req.Queues),
 		DiskFree: req.DiskFreeBytes, DiskTotal: req.DiskTotalBytes, Blocked: req.Blocked,
 		UpdateProtocol: req.UpdateProtocol, Version: req.Version, UpdateState: req.UpdateState, UpdateError: req.UpdateError,
+		ReclaimDone: req.ReclaimDone,
 	})
 	// One snapshot per poll, shared by the sweep and the pick: on the Postgres
 	// store each Snapshot is a full-table read, so a second scan is pure waste.
@@ -418,6 +419,9 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, "update target unavailable", http.StatusServiceUnavailable)
 			return
+		}
+		if target.Reclaim != "" && target.Reclaim != req.ReclaimDone {
+			w.Header().Set("X-Ushr-Reclaim-Request", target.Reclaim)
 		}
 		if version.Newer(target.Version, req.Version) && (req.FailedVersion != target.Version || req.FailedRequest != target.Request) {
 			w.Header().Set("X-Ushr-Agent-Version", target.Version)

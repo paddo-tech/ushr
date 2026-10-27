@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,6 +154,13 @@ type Agent struct {
 	// Read by the poll loop and every dispatch; written by the reclaim loop.
 	draining atomic.Bool
 
+	// reclaimNow carries an operator's cleanup request from the poll loop to
+	// the reclaim loop. reclaimAsked, the last request handed over, is written
+	// only by the poll loop, so a request it re-reads while the sweep runs
+	// isn't queued twice.
+	reclaimNow   chan string
+	reclaimAsked string
+
 	mu         sync.Mutex
 	busy       map[string]struct{}
 	unsent     map[string]api.DoneRequest // done-reports that failed to send, latest per handle
@@ -161,6 +169,7 @@ type Agent struct {
 	tombstone  map[int64]time.Time        // jobs forgotten at runner start, ignored until the time given
 	horizon    map[string]time.Time       // start of each scope's last clean pass, from the source's markers
 	unstarted  map[string]struct{}        // started-reports that failed to send, by handle
+	reclaimed  string                     // the last cleanup request a sweep finished, reported on each poll
 	wg         sync.WaitGroup             // tracks in-flight handleOffer goroutines
 }
 
@@ -186,6 +195,7 @@ func New(name string, labels []string, drv driver.Driver, client *api.Client, mi
 		orgPriority: orgPriority,
 		jobs:        jobs,
 		wake:        make(chan struct{}, 1),
+		reclaimNow:  make(chan string, 1),
 		busy:        make(map[string]struct{}),
 		unsent:      make(map[string]api.DoneRequest),
 		queue:       make(map[int64]queued),
@@ -284,6 +294,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			DiskFreeBytes:  usage.Free,
 			DiskTotalBytes: usage.Total,
 			Blocked:        blocked,
+			ReclaimDone:    a.reclaimDone(),
 		}
 		// Cancel the server-held long-poll the moment new work arrives, so a job
 		// discovered mid-hold is reported on an immediate re-poll instead of
@@ -324,6 +335,13 @@ func (a *Agent) Run(ctx context.Context) error {
 				return err
 			}
 			healthy = true
+		}
+		if r := a.Client.ReclaimRequest; r != "" && r != a.reclaimAsked {
+			select {
+			case a.reclaimNow <- r:
+				a.reclaimAsked = r
+			default:
+			}
 		}
 		if desired := a.Client.UpdateVersion; target == "" && a.Update != nil && version.Newer(desired, a.Version) && (desired != a.FailedVersion || a.Client.UpdateRequest != a.FailedRequest) {
 			target, request = desired, a.Client.UpdateRequest
@@ -446,17 +464,64 @@ func (a *Agent) handleOffer(ctx context.Context, o *api.Offer) {
 // certainty that nothing live is destroyed.
 func (a *Agent) reclaimLoop(ctx context.Context) {
 	r, ok := a.Driver.(driver.Reclaimer)
-	if !ok || a.ReclaimFloor == 0 {
+	if !ok {
 		return
 	}
 	t := time.NewTicker(reclaimInterval)
 	defer t.Stop()
 	var cooldownUntil time.Time
+	// Drain-gated steps a sweep or an operator cleanup couldn't run yet. They
+	// run the next time the host is idle, when deselecting it costs no work.
+	drainOwed, cleanupOwed := false, ""
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case id := <-a.reclaimNow:
+			if a.reclaimAll(ctx, r) {
+				a.markReclaimed(id)
+				cleanupOwed = ""
+			} else {
+				cleanupOwed = id
+			}
+			cooldownUntil = time.Time{}
+			continue
 		case <-t.C:
+		}
+		if drainOwed || cleanupOwed != "" {
+			// Deselect before the idle check: a dispatch reserves its slot before
+			// it checks the host, so one racing this check is either seen busy
+			// here or declined. A busy host falls through to the pressure sweep,
+			// so its online steps keep running while the drain waits.
+			path := a.storePath(ctx)
+			u, err := disk.Stat(path)
+			a.draining.Store(true)
+			// An unmeasured store is no evidence of pressure; an operator's
+			// cleanup runs regardless.
+			if len(a.busyHandles()) == 0 && (err == nil || cleanupOwed != "") {
+				target := uint64(math.MaxUint64)
+				if cleanupOwed == "" {
+					target = a.reclaimTarget(u.Total)
+				}
+				free, drained := u.Free, true
+				if free < target {
+					free, drained = a.drainAndReclaim(ctx, path, a.tiers(ctx, r), free, target)
+				}
+				a.draining.Store(false)
+				if drained {
+					if cleanupOwed != "" {
+						a.markReclaimed(cleanupOwed)
+					} else if free < target {
+						cooldownUntil = time.Now().Add(reclaimCooldown)
+					}
+					drainOwed, cleanupOwed = false, ""
+				}
+				continue
+			}
+			a.draining.Store(false)
+		}
+		if a.ReclaimFloor == 0 {
+			continue
 		}
 		path := a.storePath(ctx)
 		if path == "" {
@@ -473,18 +538,18 @@ func (a *Agent) reclaimLoop(ctx context.Context) {
 		slog.Info("image store under pressure, reclaiming",
 			"free_gb", u.Free>>30, "target_gb", target>>30)
 
-		tiers := r.ReclaimTiers(ctx)
-		if a.Actions != nil {
-			// Cheapest to lose: every archive is one download away.
-			tiers = append([]driver.Tier{{Name: "action cache", Run: a.Actions.Reclaim}}, tiers...)
-		}
+		tiers := a.tiers(ctx, r)
 		free := a.runTiers(path, tiers, u.Free, target, false)
-		// Drain only once under the floor, never merely near it. There the host
-		// is already refusing work, so deselecting it to go quiet costs nothing
-		// that isn't already lost; above the floor it would trade real throughput
-		// for a prune.
-		if free < a.ReclaimFloor && hasDrainTier(tiers) {
-			free = a.drainAndReclaim(ctx, path, tiers, free, target)
+		// Drain a busy host only once under the floor. There it is already
+		// refusing work, so going quiet costs nothing that isn't already lost;
+		// above the floor it would trade real throughput for a prune, so the
+		// drain waits for the host to go idle instead.
+		if free < target && hasDrainTier(tiers) {
+			if free < a.ReclaimFloor {
+				free, _ = a.drainAndReclaim(ctx, path, tiers, free, target)
+			} else {
+				drainOwed = true
+			}
 		}
 
 		// Measured from here, not from the tick: a sweep can outlast the
@@ -497,6 +562,46 @@ func (a *Agent) reclaimLoop(ctx context.Context) {
 		}
 		slog.Info("reclaim finished", "free_gb", free>>30)
 	}
+}
+
+func (a *Agent) tiers(ctx context.Context, r driver.Reclaimer) []driver.Tier {
+	tiers := r.ReclaimTiers(ctx)
+	if a.Actions != nil {
+		// Cheapest to lose: every archive is one download away.
+		tiers = append([]driver.Tier{{Name: "action cache", Run: a.Actions.Reclaim}}, tiers...)
+	}
+	return tiers
+}
+
+// reclaimAll is an operator's cleanup: every step, drain-gated ones included,
+// whatever the free space reads. The operator has chosen to trade this host's
+// throughput and warm caches for the disk. False means the host stayed busy
+// through the drain, so the drain-gated steps are still to run.
+func (a *Agent) reclaimAll(ctx context.Context, r driver.Reclaimer) bool {
+	// The target is unreachable, so every tier runs whether or not the store can be measured.
+	path := a.storePath(ctx)
+	u, _ := disk.Stat(path)
+	slog.Info("cleanup requested, reclaiming everything", "free_gb", u.Free>>30)
+	tiers := a.tiers(ctx, r)
+	free := a.runTiers(path, tiers, u.Free, math.MaxUint64, false)
+	drained := true
+	if hasDrainTier(tiers) {
+		free, drained = a.drainAndReclaim(ctx, path, tiers, free, math.MaxUint64)
+	}
+	slog.Info("cleanup finished", "free_gb", free>>30, "drained", drained)
+	return drained
+}
+
+func (a *Agent) markReclaimed(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reclaimed = id
+}
+
+func (a *Agent) reclaimDone() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reclaimed
 }
 
 // reclaimTarget is the free-space mark a sweep works toward: clear of the floor
@@ -524,8 +629,9 @@ func (a *Agent) reclaimTrigger(target uint64) uint64 {
 
 // drainAndReclaim deselects the host, waits for it to go quiet, and runs the
 // drain-gated steps. A host that never goes quiet within drainWait keeps its
-// caches: idling it further to prune would cost more than the disk does.
-func (a *Agent) drainAndReclaim(ctx context.Context, path string, tiers []driver.Tier, free, target uint64) uint64 {
+// caches: idling it further to prune would cost more than the disk does. The
+// bool reports whether the drain-gated steps ran.
+func (a *Agent) drainAndReclaim(ctx context.Context, path string, tiers []driver.Tier, free, target uint64) (uint64, bool) {
 	a.draining.Store(true)
 	defer a.draining.Store(false)
 	slog.Info("deselecting host to drain for reclaim", "busy", len(a.busyHandles()))
@@ -534,15 +640,15 @@ func (a *Agent) drainAndReclaim(ctx context.Context, path string, tiers []driver
 	for len(a.busyHandles()) > 0 {
 		select {
 		case <-ctx.Done():
-			return free
+			return free, false
 		case <-deadline:
 			slog.Warn("host still busy at drain deadline, skipping drain-gated reclaim",
 				"busy", len(a.busyHandles()))
-			return free
+			return free, false
 		case <-time.After(time.Second):
 		}
 	}
-	return a.runTiers(path, tiers, free, target, true)
+	return a.runTiers(path, tiers, free, target, true), true
 }
 
 // runTiers works through the steps of one class in order, stopping as soon as

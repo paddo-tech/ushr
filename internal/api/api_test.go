@@ -807,6 +807,38 @@ func TestUpdateTargetPolicy(t *testing.T) {
 	}
 }
 
+type reclaimRecorder struct{ telemetry.Noop }
+
+func (reclaimRecorder) AgentUpdateTarget(context.Context, string) (telemetry.UpdateTarget, error) {
+	return telemetry.UpdateTarget{Reclaim: "cleanup-1"}, nil
+}
+
+// An open cleanup request rides every poll until the agent reports it done.
+func TestReclaimRequestUntilDone(t *testing.T) {
+	for _, tt := range []struct {
+		name, done string
+		sent       bool
+	}{
+		{name: "open", sent: true},
+		{name: "earlier request done", done: "cleanup-0", sent: true},
+		{name: "done", done: "cleanup-1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewServer(0, "", memLedger(t), nil)
+			server.WithTelemetry(reclaimRecorder{})
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			body, _ := json.Marshal(PollRequest{Version: "0.2.5", UpdateProtocol: 2, ReclaimDone: tt.done})
+			req := httptest.NewRequest(http.MethodPost, "/v1/agents/host/poll", bytes.NewReader(body)).WithContext(ctx)
+			w := httptest.NewRecorder()
+			server.Routes().ServeHTTP(w, req)
+			if sent := w.Header().Get("X-Ushr-Reclaim-Request") == "cleanup-1"; sent != tt.sent {
+				t.Fatalf("cleanup request sent=%v, want %v", sent, tt.sent)
+			}
+		})
+	}
+}
+
 func TestRunnerNamesFitLongestEnrolledHost(t *testing.T) {
 	host := strings.Repeat("a", 32)
 	first, second := domain.RunnerName(host), domain.RunnerName(host)

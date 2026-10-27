@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/paddo-tech/ushr/internal/api"
+	"github.com/paddo-tech/ushr/internal/disk"
 	"github.com/paddo-tech/ushr/internal/dispatch"
 	"github.com/paddo-tech/ushr/internal/domain"
 	"github.com/paddo-tech/ushr/internal/driver"
@@ -731,6 +732,75 @@ func TestReclaimHoldsOffAfterShortfall(t *testing.T) {
 	if got := len(drv.ranTiers()); got != 1 {
 		t.Fatalf("ran %d tiers across the cooldown, want 1", got)
 	}
+}
+
+// An operator's cleanup runs every step, drain-gated ones included, even with
+// automatic reclaim off and the disk clear of any floor, and is then reported.
+func TestCleanupRequestRunsEveryTier(t *testing.T) {
+	prev := reclaimInterval
+	t.Cleanup(func() { reclaimInterval = prev })
+	reclaimInterval = 5 * time.Millisecond
+
+	drv := &reclaimDriver{stuckDriver: &stuckDriver{diskPath: t.TempDir()}, withDrain: true}
+	a := New("t1", nil, drv, nil, nil, nil, nil)
+	runReclaimLoop(t, a)
+	a.reclaimNow <- "cleanup-1"
+
+	waitFor(t, "the cleanup to be reported", func() bool { return a.reclaimDone() == "cleanup-1" })
+	if got := drv.ranTiers(); !contains(got, "online") || !contains(got, "drain") {
+		t.Fatalf("tiers ran %v, want every tier", got)
+	}
+}
+
+// A cleanup whose drain times out on a busy host stays open, and finishes once
+// the host goes idle.
+func TestCleanupWaitsOutBusyHost(t *testing.T) {
+	prevInterval, prevWait := reclaimInterval, drainWait
+	t.Cleanup(func() { reclaimInterval, drainWait = prevInterval, prevWait })
+	reclaimInterval, drainWait = 5*time.Millisecond, 20*time.Millisecond
+
+	drv := &reclaimDriver{stuckDriver: &stuckDriver{diskPath: t.TempDir()}, withDrain: true}
+	a := New("t1", nil, drv, nil, nil, nil, nil)
+	a.markBusy("ushr-t1-7")
+	runReclaimLoop(t, a)
+	a.reclaimNow <- "cleanup-1"
+
+	time.Sleep(100 * time.Millisecond) // the drain deadline passes with the slot busy
+	if a.reclaimDone() != "" || contains(drv.ranTiers(), "drain") {
+		t.Fatal("a cleanup that couldn't drain was reported done")
+	}
+	a.markFree("ushr-t1-7")
+	waitFor(t, "the cleanup to be reported", func() bool { return a.reclaimDone() == "cleanup-1" })
+	if !contains(drv.ranTiers(), "drain") {
+		t.Fatal("cleanup reported done without its drain-gated tier")
+	}
+}
+
+// Above the floor a short sweep never deselects a busy host, but drains as soon
+// as the host is idle, so a disk that hovers just above the floor still clears.
+func TestReclaimDrainsWhenIdleAboveFloor(t *testing.T) {
+	prev := reclaimInterval
+	t.Cleanup(func() { reclaimInterval = prev })
+	reclaimInterval = 5 * time.Millisecond
+
+	dir := t.TempDir()
+	u, err := disk.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := &reclaimDriver{stuckDriver: &stuckDriver{diskPath: dir}, withDrain: true}
+	a := New("t1", nil, drv, nil, nil, nil, nil)
+	a.ReclaimFloor = u.Free / 10 * 9 // free sits above the floor, under the target
+	a.markBusy("ushr-t1-7")
+	runReclaimLoop(t, a)
+
+	waitFor(t, "the online tier to run", func() bool { return contains(drv.ranTiers(), "online") })
+	time.Sleep(50 * time.Millisecond)
+	if a.draining.Load() || contains(drv.ranTiers(), "drain") {
+		t.Fatal("a busy host above the floor was drained")
+	}
+	a.markFree("ushr-t1-7")
+	waitFor(t, "the idle drain", func() bool { return contains(drv.ranTiers(), "drain") })
 }
 
 // Twice the floor is unreachable on a disk only a few times the floor, and a

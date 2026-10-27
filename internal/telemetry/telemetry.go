@@ -34,9 +34,12 @@ type Recorder interface {
 	Event(org, dispatchID, event string, payload map[string]any)
 }
 
+// UpdateTarget is what an operator has asked of an agent: a version to run,
+// and Reclaim, an open disk cleanup request.
 type UpdateTarget struct {
 	Version string
 	Request string
+	Reclaim string
 }
 
 // Beat is one agent heartbeat: its liveness identity plus the capacity and
@@ -59,6 +62,9 @@ type Beat struct {
 	DiskFree   uint64
 	DiskTotal  uint64
 	Blocked    bool
+	// ReclaimDone is the last cleanup request the agent finished; a matching
+	// open request is cleared.
+	ReclaimDone string
 }
 
 // Noop is the OSS default: telemetry disabled.
@@ -157,6 +163,7 @@ ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_request text NOT NULL D
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_protocol integer NOT NULL DEFAULT 0;
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_state text NOT NULL DEFAULT '';
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS update_error text NOT NULL DEFAULT '';
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS reclaim_request text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS dispatch_events (
 	seq            bigserial PRIMARY KEY,
 	account_org_id text,
@@ -377,10 +384,11 @@ func (p *PG) AgentSeen(b Beat) {
 				blocked = EXCLUDED.blocked,
  desired_version = CASE WHEN ltrim(agent_status.desired_version, 'v') = ltrim(EXCLUDED.version, 'v') THEN '' ELSE agent_status.desired_version END,
  update_protocol = EXCLUDED.update_protocol, version = EXCLUDED.version, update_state = EXCLUDED.update_state, update_error = EXCLUDED.update_error,
+				reclaim_request = CASE WHEN $16::text <> '' AND agent_status.reclaim_request = $16::text THEN '' ELSE agent_status.reclaim_request END,
 				account_org_id = COALESCE(EXCLUDED.account_org_id, agent_status.account_org_id),
 				last_seen = EXCLUDED.last_seen`,
 			org, b.Key, b.Name, orgsArg, labelsArg, b.Capacity, b.Busy, b.QueueDepth,
-			diskFree, diskTotal, b.Blocked, b.Version, b.UpdateState, b.UpdateError, b.UpdateProtocol)
+			diskFree, diskTotal, b.Blocked, b.Version, b.UpdateState, b.UpdateError, b.UpdateProtocol, b.ReclaimDone)
 		if err != nil {
 			slog.Warn("telemetry agent_status upsert failed", "agent", b.Key, "err", err)
 		}
@@ -411,6 +419,6 @@ func (p *PG) AgentUpdateTarget(ctx context.Context, key string) (UpdateTarget, e
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	var target UpdateTarget
-	err := p.pool.QueryRow(ctx, `SELECT COALESCE((SELECT desired_version FROM agent_status WHERE key=$1),''), COALESCE((SELECT update_request FROM agent_status WHERE key=$1),'')`, key).Scan(&target.Version, &target.Request)
+	err := p.pool.QueryRow(ctx, `SELECT COALESCE((SELECT desired_version FROM agent_status WHERE key=$1),''), COALESCE((SELECT update_request FROM agent_status WHERE key=$1),''), COALESCE((SELECT reclaim_request FROM agent_status WHERE key=$1),'')`, key).Scan(&target.Version, &target.Request, &target.Reclaim)
 	return target, err
 }

@@ -45,6 +45,11 @@ type PollRequest struct {
 	DiskFreeBytes  uint64 `json:"disk_free_bytes,omitempty"`
 	DiskTotalBytes uint64 `json:"disk_total_bytes,omitempty"`
 	Blocked        bool   `json:"blocked,omitempty"`
+
+	// ReclaimDone is the last operator cleanup request the agent finished. The
+	// control plane re-sends a request in X-Ushr-Reclaim-Request until this
+	// matches it.
+	ReclaimDone string `json:"reclaim_done,omitempty"`
 }
 
 // OrgQueue is one org's pending jobs as reported by an agent. Priority is the
