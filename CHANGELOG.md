@@ -5,6 +5,17 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.17 — 2026-10-28
+
+- When a cleanup pass falls short while the host is above its free-space
+  floor, the agent runs the drain-gated steps the next time the host is idle.
+  Before, these steps ran only below the floor, so a host that stayed just
+  above it kept its unused images and refused jobs from time to time.
+- Operators can request a full disk cleanup from the host card on the
+  dashboard. The agent runs every cleanup step. If running jobs block the
+  drain-gated steps, the agent runs them when the host goes idle, and only
+  then reports the cleanup done.
+
 ## v0.2.16 — 2026-10-11
 
 - fix(sshrunner): when the runner release lookup fails, Mac hosts use the
