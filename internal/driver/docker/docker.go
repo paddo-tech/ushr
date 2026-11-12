@@ -61,6 +61,7 @@ type Options struct {
 	Volumes    []string
 	ExtraHosts []string
 	GroupAdd   []string
+	Devices    []string
 	Memory     string
 	Entrypoint string
 	// Per-repo persistent build cache (docker driver).
@@ -87,6 +88,7 @@ type Driver struct {
 	volumes    []string
 	extraHosts []string
 	groupAdd   []string
+	devices    []string
 	memory     string
 	entrypoint string
 
@@ -160,6 +162,7 @@ func New(opts Options) *Driver {
 		volumes:        opts.Volumes,
 		extraHosts:     opts.ExtraHosts,
 		groupAdd:       opts.GroupAdd,
+		devices:        opts.Devices,
 		memory:         opts.Memory,
 		entrypoint:     opts.Entrypoint,
 		buildCache:     opts.BuildCache,
@@ -247,6 +250,9 @@ func (d *Driver) Provision(ctx context.Context, req driver.ProvisionRequest) (dr
 	}
 	for _, g := range d.groupAdd {
 		args = append(args, "--group-add", g)
+	}
+	for _, dev := range d.devices {
+		args = append(args, "--device", dev)
 	}
 	if d.memory != "" {
 		args = append(args, "--memory", d.memory)

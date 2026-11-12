@@ -180,11 +180,17 @@ type DriverConfig struct {
 	// Volumes mounts the host docker socket for buildx, GroupAdd carries the
 	// host docker GID so the runner user can use it, and Memory (e.g. "4g")
 	// caps each runner container so a heavy build OOM-kills its own job rather
-	// than the host.
+	// than the host. Devices passes host devices to every runner container
+	// (e.g. "/dev/kvm" for jobs that run a hardware-accelerated emulator).
+	// With Docker, the runner user also needs the device's numeric host GID in
+	// GroupAdd, after the docker GID: the first entry owns the build cache
+	// config. Rootless Podman does not map a numeric GID; see
+	// deploy/linux/README.md.
 	Network    string   `yaml:"network"`
 	Volumes    []string `yaml:"volumes"`
 	ExtraHosts []string `yaml:"extra_hosts"`
 	GroupAdd   []string `yaml:"group_add"`
+	Devices    []string `yaml:"devices"`
 	Memory     string   `yaml:"memory"`
 	Entrypoint string   `yaml:"entrypoint"`
 

@@ -5,6 +5,13 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+- The docker driver takes a `devices` list and passes each entry to the runner
+  container with `--device`. With Docker, set `devices: [/dev/kvm]` and add
+  the host's numeric kvm GID to `group_add`, after the docker GID, to give
+  jobs a hardware-accelerated emulator. `deploy/linux/README.md` has the
+  rootless Podman settings. Before, the driver had no option to pass a host
+  device to the runner container.
+
 ## v0.2.17 — 2026-10-28
 
 - When a cleanup pass falls short while the host is above its free-space

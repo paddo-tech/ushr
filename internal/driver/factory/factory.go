@@ -34,6 +34,7 @@ func New(cfg config.DriverConfig) (driver.Driver, error) {
 			Volumes:           cfg.Volumes,
 			ExtraHosts:        cfg.ExtraHosts,
 			GroupAdd:          cfg.GroupAdd,
+			Devices:           cfg.Devices,
 			Memory:            cfg.Memory,
 			Entrypoint:        cfg.Entrypoint,
 			BuildCache:        buildCache,
