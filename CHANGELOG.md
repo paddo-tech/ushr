@@ -5,6 +5,8 @@ The history in this repository starts at v0.2.4.
 
 ## Unreleased
 
+## v0.2.18 — 2026-11-13
+
 - The docker driver takes a `devices` list and passes each entry to the runner
   container with `--device`. With Docker, set `devices: [/dev/kvm]` and add
   the host's numeric kvm GID to `group_add`, after the docker GID, to give
